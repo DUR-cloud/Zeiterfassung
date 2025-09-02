@@ -7,10 +7,14 @@ export default defineConfig({
     react(),
     VitePWA({
       registerType: 'autoUpdate',
+      workbox: {
+        // Cache-Strategie: HTML immer online-first, Assets offline verfügbar
+        navigateFallbackDenylist: [/^\/api\//],
+      },
       includeAssets: ['favicon.svg'],
       manifest: {
         name: 'Zeiterfassung',
-        short_name: 'Zeiterfassung',
+        short_name: 'Zeiterf.',
         description: 'Digitale Zeiterfassung für Mitarbeiter',
         start_url: '/',
         scope: '/',
