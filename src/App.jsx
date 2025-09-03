@@ -1,31 +1,39 @@
 import { useEffect, useMemo, useState } from "react";
 import { jsPDF } from "jspdf";
 import "jspdf-autotable";
+import { supabase } from "./supabaseClient";
 
 // ---------- Konstanten ----------
 const LS_KEYS = {
-  employees: "zeiterfassung_employees_v3",
-  projects: "zeiterfassung_projects_v3",
   records: "zeiterfassung_records_v3",
   logo: "zeiterfassung_logo_v3",
   vacations: "zeiterfassung_vacations_v1",
 };
 
-const ADMIN_FALLBACK = "chef123"; // Admin-Passwort (einfach). Später gern auf Hash umstellen.
+const ADMIN_FALLBACK = "chef123"; // Admin-Passwort (einfach)
 
 // ---------- Hilfsfunktionen ----------
-const newId = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
-const fmtTime = (d) => (d ? new Date(d).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "");
+const newId = () =>
+  Math.random().toString(36).slice(2) + Date.now().toString(36);
+const fmtTime = (d) =>
+  d ? new Date(d).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
 const fmtDate = (d) => (d ? new Date(d).toLocaleDateString() : "");
 
 async function sha256Hex(text) {
   const buf = new TextEncoder().encode(text);
   const hashBuf = await crypto.subtle.digest("SHA-256", buf);
-  return Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, "0")).join("");
+  return Array.from(new Uint8Array(hashBuf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function safeParse(json, fallback) {
-  try { const v = JSON.parse(json); return v ?? fallback; } catch { return fallback; }
+  try {
+    const v = JSON.parse(json);
+    return v ?? fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 // 12–13 Uhr Pause automatisch abziehen, wenn Intervall überlappt
@@ -45,86 +53,83 @@ function subtractLunchIfNeeded(startISO, endISO) {
   return { minutes, lunchApplied: false };
 }
 
-// Migration Records {employee, project, date, start, end} → ISO + Dauer
-function migrateRecords(list) {
-  if (!Array.isArray(list)) return [];
-  return list.map((r) => {
-    const startISO = r.startISO ?? (r.start && r.date ? new Date(`${r.date} ${r.start}`).toISOString() : null);
-    const endISO   = r.endISO   ?? (r.end   && r.date ? new Date(`${r.date} ${r.end}`).toISOString()   : null);
-    const { minutes, lunchApplied } = (startISO && endISO) ? subtractLunchIfNeeded(startISO, endISO) : { minutes: 0, lunchApplied: false };
-    return {
-      employee: r.employee || "",
-      project:  r.project  || "",
-      date:     r.date     || (startISO ? fmtDate(startISO) : ""),
-      startISO,
-      endISO,
-      duration: minutes,
-      lunchApplied,
-    };
-  }).filter(r => r.employee && r.project && r.date && r.startISO && r.endISO);
-}
-
 // ---------- Hauptkomponente ----------
 export default function App() {
   // Rollen: null (Login), "employee", "admin"
   const [role, setRole] = useState(null);
 
-  // Stammdaten + Daten
+  // Stammdaten (Supabase)
   const [employees, setEmployees] = useState([]);
-  const [projects,  setProjects]  = useState([]);
-  const [records,   setRecords]   = useState([]);
+  const [projects, setProjects] = useState([]);
+
+  // Datenerfassung (lokal)
+  const [records, setRecords] = useState([]);
   const [logoDataUrl, setLogoDataUrl] = useState(null);
 
-  // Urlaub
+  // Urlaub (lokal)
   const [vacations, setVacations] = useState([]);
 
   // Logins
-  const [loginPw, setLoginPw] = useState("");          // Admin
-  const [loginName, setLoginName] = useState("");      // Mitarbeiter
-  const [empPw, setEmpPw] = useState("");              // Mitarbeiter
+  const [loginPw, setLoginPw] = useState(""); // Admin
+  const [loginName, setLoginName] = useState(""); // Mitarbeiter
+  const [empPw, setEmpPw] = useState(""); // Mitarbeiter
   const [currentEmployee, setCurrentEmployee] = useState(null);
 
-  // Erfassung
+  // Auswahl/Erfassung
   const [selectedProject, setSelectedProject] = useState("");
   const [startTime, setStartTime] = useState(null);
 
-  // Admin-Form „Neuer Mitarbeiter“
+  // Admin-Form „Neuer Mitarbeiter/Projekt“
   const [newEmpName, setNewEmpName] = useState("");
   const [newEmpPw, setNewEmpPw] = useState("");
+  const [newProject, setNewProject] = useState("");
 
   // Mitarbeiter: Urlaub beantragen
   const [vacStart, setVacStart] = useState("");
   const [vacEnd, setVacEnd] = useState("");
 
-  // ----- Laden -----
+  // ---------- Supabase Laden: employees & projects ----------
   useEffect(() => {
-    const e = safeParse(localStorage.getItem(LS_KEYS.employees), null);
-    const p = safeParse(localStorage.getItem(LS_KEYS.projects), null);
-    const r = safeParse(localStorage.getItem(LS_KEYS.records), null);
+    (async () => {
+      const { data, error } = await supabase
+        .from("employees")
+        .select("*")
+        .order("name");
+      if (!error && Array.isArray(data)) setEmployees(data);
+    })();
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      const { data, error } = await supabase
+        .from("projects")
+        .select("*")
+        .order("name");
+      if (!error && Array.isArray(data)) setProjects(data);
+    })();
+  }, []);
+
+  // ---------- Lokal Laden: records, vacations, logo ----------
+  useEffect(() => {
+    const r = safeParse(localStorage.getItem(LS_KEYS.records), []);
     const v = safeParse(localStorage.getItem(LS_KEYS.vacations), []);
     const l = localStorage.getItem(LS_KEYS.logo) || null;
-
-    const defaultsEmployees = [
-      { id: newId(), name: "Max",  passwordHash: "ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f", active: true }, // test123
-      { id: newId(), name: "Anna", passwordHash: "5994471abb01112afcc18159f6cc74b4f511b99806da59b3caf5a9c173cacfc5", active: true }, // 12345
-    ];
-    const defaultsProjects = [{ id: newId(), name: "Projekt A" }, { id: newId(), name: "Projekt B" }];
-
-    setEmployees(Array.isArray(e) && e.length ? e : defaultsEmployees);
-    setProjects(Array.isArray(p) && p.length ? p : defaultsProjects);
-    setRecords(migrateRecords(r ?? []));
+    setRecords(Array.isArray(r) ? r : []);
     setVacations(Array.isArray(v) ? v : []);
     setLogoDataUrl(l);
   }, []);
 
-  // ----- Speichern -----
-  useEffect(() => { localStorage.setItem(LS_KEYS.employees, JSON.stringify(employees)); }, [employees]);
-  useEffect(() => { localStorage.setItem(LS_KEYS.projects,  JSON.stringify(projects));  }, [projects]);
-  useEffect(() => { localStorage.setItem(LS_KEYS.records,   JSON.stringify(records));   }, [records]);
-  useEffect(() => { localStorage.setItem(LS_KEYS.vacations, JSON.stringify(vacations)); }, [vacations]);
-  useEffect(() => { if (logoDataUrl) localStorage.setItem(LS_KEYS.logo, logoDataUrl);   }, [logoDataUrl]);
+  useEffect(() => {
+    localStorage.setItem(LS_KEYS.records, JSON.stringify(records));
+  }, [records]);
+  useEffect(() => {
+    localStorage.setItem(LS_KEYS.vacations, JSON.stringify(vacations));
+  }, [vacations]);
+  useEffect(() => {
+    if (logoDataUrl) localStorage.setItem(LS_KEYS.logo, logoDataUrl);
+  }, [logoDataUrl]);
 
-  // ----- Admin Login (einfach) -----
+  // ---------- Logins ----------
   const handleLogin = () => {
     if (loginPw !== ADMIN_FALLBACK) return alert("Falsches Admin-Passwort");
     setRole("admin");
@@ -132,9 +137,8 @@ export default function App() {
     setCurrentEmployee(null);
   };
 
-  // ----- Mitarbeiter Login -----
   const handleEmployeeLogin = async () => {
-    const emp = employees.find(e => e.name === loginName && e.active);
+    const emp = employees.find((e) => e.name === loginName && e.active !== false);
     if (!emp) return alert("Mitarbeiter nicht gefunden oder deaktiviert");
     const hash = await sha256Hex(empPw);
     if (emp.passwordHash === hash) {
@@ -154,39 +158,69 @@ export default function App() {
     setStartTime(null);
   };
 
-  // ----- Mitarbeiter anlegen -----
+  // ---------- Mitarbeiter (Supabase) ----------
   const addEmployee = async () => {
-    if (!newEmpName.trim() || !newEmpPw.trim()) {
-      alert("Bitte Name und Passwort eingeben");
-      return;
-    }
+    if (!newEmpName.trim() || !newEmpPw.trim()) return alert("Bitte Name & Passwort eingeben");
     const passwordHash = await sha256Hex(newEmpPw);
-    const newEmp = { id: newId(), name: newEmpName.trim(), passwordHash, active: true };
-    setEmployees(prev => [...prev, newEmp]);
+
+    const { data, error } = await supabase
+      .from("employees")
+      .insert({ name: newEmpName.trim(), passwordHash, active: true })
+      .select()
+      .single();
+
+    if (error) return alert("Fehler beim Speichern: " + error.message);
+    setEmployees((prev) => [...prev, data]);
     setNewEmpName("");
     setNewEmpPw("");
   };
-  const toggleEmployee = (id) => setEmployees(s => s.map(e => e.id === id ? { ...e, active: !e.active } : e));
 
-  // ----- Projekte -----
-  const [newProject, setNewProject] = useState("");
-  const addProject = () => {
+  const toggleEmployee = async (id) => {
+    const emp = employees.find((e) => e.id === id);
+    if (!emp) return;
+    const { data, error } = await supabase
+      .from("employees")
+      .update({ active: !emp.active })
+      .eq("id", id)
+      .select()
+      .single();
+    if (error) return alert("Fehler: " + error.message);
+    setEmployees((prev) => prev.map((e) => (e.id === id ? data : e)));
+  };
+
+  // ---------- Projekte (Supabase) ----------
+  const addProject = async () => {
     if (!newProject.trim()) return;
-    setProjects(s => [...s, { id: newId(), name: newProject.trim() }]);
+    const { data, error } = await supabase
+      .from("projects")
+      .insert({ name: newProject.trim() })
+      .select()
+      .single();
+    if (error) return alert("Fehler beim Speichern: " + error.message);
+    setProjects((prev) => [...prev, data]);
     setNewProject("");
   };
-  const removeProject = (id) => setProjects(s => s.filter(p => p.id !== id));
 
-  // ----- Erfassung -----
+  const removeProject = async (id) => {
+    const { error } = await supabase.from("projects").delete().eq("id", id);
+    if (error) return alert("Fehler beim Löschen: " + error.message);
+    setProjects((prev) => prev.filter((p) => p.id !== id));
+  };
+
+  // ---------- Erfassung (lokal) ----------
   const handleStart = () => {
     if (!currentEmployee) return alert("Bitte als Mitarbeiter einloggen");
     if (!selectedProject) return alert("Bitte Projekt wählen");
     setStartTime(new Date());
   };
+
   const handleStop = () => {
     if (!startTime || !currentEmployee) return;
     const end = new Date();
-    const { minutes, lunchApplied } = subtractLunchIfNeeded(startTime.toISOString(), end.toISOString());
+    const { minutes, lunchApplied } = subtractLunchIfNeeded(
+      startTime.toISOString(),
+      end.toISOString()
+    );
     const rec = {
       employee: currentEmployee.name,
       project: selectedProject,
@@ -196,15 +230,16 @@ export default function App() {
       duration: minutes,
       lunchApplied,
     };
-    setRecords(prev => [...prev, rec]);
+    setRecords((prev) => [...prev, rec]);
     setStartTime(null);
   };
 
-  // ----- Urlaubsfunktionen -----
+  // ---------- Urlaub (lokal) ----------
   const handleVacationRequest = () => {
     if (!currentEmployee) return alert("Bitte einloggen");
     if (!vacStart || !vacEnd) return alert("Bitte Start- und Enddatum wählen");
-    if (new Date(vacEnd) < new Date(vacStart)) return alert("Enddatum muss >= Startdatum sein");
+    if (new Date(vacEnd) < new Date(vacStart))
+      return alert("Enddatum muss >= Startdatum sein");
 
     const newVac = {
       id: newId(),
@@ -213,28 +248,46 @@ export default function App() {
       endDate: vacEnd,
       status: "offen",
     };
-    setVacations(prev => [...prev, newVac]);
+    setVacations((prev) => [...prev, newVac]);
     setVacStart("");
     setVacEnd("");
   };
-  const approveVacation = (id) => setVacations(prev => prev.map(v => v.id === id ? { ...v, status: "genehmigt" } : v));
-  const rejectVacation  = (id) => setVacations(prev => prev.map(v => v.id === id ? { ...v, status: "abgelehnt" } : v));
+  const approveVacation = (id) =>
+    setVacations((prev) =>
+      prev.map((v) => (v.id === id ? { ...v, status: "genehmigt" } : v))
+    );
+  const rejectVacation = (id) =>
+    setVacations((prev) =>
+      prev.map((v) => (v.id === id ? { ...v, status: "abgelehnt" } : v))
+    );
 
-  // ----- Exporte -----
+  // ---------- Exporte ----------
   const exportCSV = () => {
     if (!records.length) return;
     const header = ["Mitarbeiter", "Projekt", "Datum", "Start", "Ende", "Minuten", "Lunch(12-13)"];
-    const rows = records.map(r => [r.employee, r.project, r.date, fmtTime(r.startISO), fmtTime(r.endISO), String(r.duration ?? ""), r.lunchApplied ? "ja" : "nein"]);
-    const csv = [header, ...rows].map(row => row.join(";")).join("\n");
+    const rows = records.map((r) => [
+      r.employee,
+      r.project,
+      r.date,
+      fmtTime(r.startISO),
+      fmtTime(r.endISO),
+      String(r.duration ?? ""),
+      r.lunchApplied ? "ja" : "nein",
+    ]);
+    const csv = [header, ...rows].map((row) => row.join(";")).join("\n");
     const blob = new Blob([csv], { type: "text/csv" });
-    const url = URL.createObjectURL(blob); const a = document.createElement("a");
-    a.href = url; a.download = "zeiterfassung.csv"; a.click(); URL.revokeObjectURL(url);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "zeiterfassung.csv";
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const exportExcel = async () => {
     if (!records.length) return;
-    const XLSX = await import("xlsx"); // dynamisch, verhindert Build-Probleme
-    const data = records.map(r => ({
+    const XLSX = await import("xlsx");
+    const data = records.map((r) => ({
       Mitarbeiter: r.employee,
       Projekt: r.project,
       Datum: r.date,
@@ -252,12 +305,24 @@ export default function App() {
   const exportPDF = () => {
     if (!records.length) return;
     const doc = new jsPDF();
-    if (logoDataUrl) { try { doc.addImage(logoDataUrl, "PNG", 12, 10, 20, 20); } catch {} }
+    if (logoDataUrl) {
+      try {
+        doc.addImage(logoDataUrl, "PNG", 12, 10, 20, 20);
+      } catch {}
+    }
     doc.setFontSize(16);
     doc.text("Zeiterfassung Bericht", 40, 22);
 
     const head = [["Mitarbeiter", "Projekt", "Datum", "Start", "Ende", "Minuten", "Lunch(12-13)"]];
-    const body = records.map(r => [r.employee, r.project, r.date, fmtTime(r.startISO), fmtTime(r.endISO), String(r.duration ?? ""), r.lunchApplied ? "ja" : "nein"]);
+    const body = records.map((r) => [
+      r.employee,
+      r.project,
+      r.date,
+      fmtTime(r.startISO),
+      fmtTime(r.endISO),
+      String(r.duration ?? ""),
+      r.lunchApplied ? "ja" : "nein",
+    ]);
     doc.autoTable({ head, body, startY: 36 });
     doc.save("zeiterfassung.pdf");
   };
@@ -269,68 +334,14 @@ export default function App() {
     reader.readAsDataURL(file);
   };
 
-  // ----- Backup / Restore -----
-  function downloadJSON(filename, dataObj) {
-    const blob = new Blob([JSON.stringify(dataObj, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a"); a.href = url; a.download = filename; a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  const backupAll = () => {
-    const payload = {
-      version: 3,
-      exportedAt: new Date().toISOString(),
-      employees, projects, records, vacations,
-      logoDataUrl: logoDataUrl || null,
-    };
-    downloadJSON("zeiterfassung-backup.json", payload);
-  };
-
-  const restoreAllFromFile = async (file) => {
-    if (!file) return;
-    try {
-      const text = await file.text();
-      const data = JSON.parse(text);
-      if (!data || typeof data !== "object") throw new Error("Ungültige Datei.");
-
-      const cleanEmployees = Array.isArray(data.employees) ? data.employees.map(e => ({
-        id: e.id || newId(),
-        name: String(e.name || "").trim(),
-        passwordHash: String(e.passwordHash || ""), // wichtig fürs Login
-        active: e.active !== false,
-      })).filter(e => e.name && e.passwordHash) : [];
-
-      const cleanProjects = Array.isArray(data.projects) ? data.projects.map(p => ({
-        id: p.id || newId(),
-        name: String(p.name || "").trim(),
-      })).filter(p => p.name) : [];
-
-      const cleanRecords = migrateRecords(Array.isArray(data.records) ? data.records : []);
-
-      const cleanVacations = Array.isArray(data.vacations) ? data.vacations.map(v => ({
-        id: v.id || newId(),
-        employeeId: v.employeeId || "",
-        startDate: v.startDate || "",
-        endDate: v.endDate || "",
-        status: ["offen","genehmigt","abgelehnt"].includes(v.status) ? v.status : "offen",
-      })).filter(v => v.employeeId && v.startDate && v.endDate) : [];
-
-      if (cleanEmployees.length) setEmployees(cleanEmployees);
-      if (cleanProjects.length)  setProjects(cleanProjects);
-      setRecords(cleanRecords);
-      setVacations(cleanVacations);
-      if (data.logoDataUrl) setLogoDataUrl(data.logoDataUrl);
-
-      alert("Backup erfolgreich eingespielt ✅");
-    } catch (err) {
-      console.error(err);
-      alert("Import fehlgeschlagen: " + err.message);
-    }
-  };
-
   // Anzeige-Hilfen
-  const myVacations = useMemo(() => currentEmployee ? vacations.filter(v => v.employeeId === currentEmployee.id) : [], [vacations, currentEmployee]);
+  const myVacations = useMemo(
+    () =>
+      currentEmployee
+        ? vacations.filter((v) => v.employeeId === currentEmployee.id)
+        : [],
+    [vacations, currentEmployee]
+  );
 
   return (
     <div style={{ padding: 16, maxWidth: 980, margin: "0 auto" }}>
@@ -342,14 +353,28 @@ export default function App() {
           <h3>Login</h3>
           <div style={{ display: "grid", gap: 8, maxWidth: 360 }}>
             <strong>Mitarbeiter</strong>
-            <input placeholder="Name" value={loginName} onChange={(e) => setLoginName(e.target.value)} />
-            <input type="password" placeholder="Passwort" value={empPw} onChange={(e) => setEmpPw(e.target.value)} />
+            <input
+              placeholder="Name"
+              value={loginName}
+              onChange={(e) => setLoginName(e.target.value)}
+            />
+            <input
+              type="password"
+              placeholder="Passwort"
+              value={empPw}
+              onChange={(e) => setEmpPw(e.target.value)}
+            />
             <button onClick={handleEmployeeLogin}>Mitarbeiter Login</button>
 
             <div style={{ margin: "8px 0", opacity: 0.6 }}>— oder —</div>
 
             <strong>Admin</strong>
-            <input type="password" placeholder="Admin-Passwort" value={loginPw} onChange={(e) => setLoginPw(e.target.value)} />
+            <input
+              type="password"
+              placeholder="Admin-Passwort"
+              value={loginPw}
+              onChange={(e) => setLoginPw(e.target.value)}
+            />
             <button onClick={handleLogin}>Admin Login</button>
           </div>
         </section>
@@ -359,26 +384,46 @@ export default function App() {
       {role === "employee" && currentEmployee && (
         <section style={{ marginTop: 16 }}>
           <h3>Zeiterfassung für {currentEmployee.name}</h3>
-          <button onClick={handleLogout} style={{ marginBottom: 8 }}>Logout</button>
+          <button onClick={handleLogout} style={{ marginBottom: 8 }}>
+            Logout
+          </button>
 
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-            <select value={selectedProject} onChange={(e) => setSelectedProject(e.target.value)}>
+            <select
+              value={selectedProject}
+              onChange={(e) => setSelectedProject(e.target.value)}
+            >
               <option value="">Projekt wählen</option>
-              {projects.map(p => <option key={p.id} value={p.name}>{p.name}</option>)}
+              {projects.map((p) => (
+                <option key={p.id} value={p.name}>
+                  {p.name}
+                </option>
+              ))}
             </select>
-            <button onClick={handleStart} disabled={!selectedProject || !!startTime}>Start</button>
-            <button onClick={handleStop} disabled={!startTime}>Stop</button>
+            <button onClick={handleStart} disabled={!selectedProject || !!startTime}>
+              Start
+            </button>
+            <button onClick={handleStop} disabled={!startTime}>
+              Stop
+            </button>
             {startTime && <span>Gestartet: {fmtTime(startTime.toISOString())}</span>}
           </div>
 
           <h4 style={{ marginTop: 16 }}>Zuletzt erfasste Zeiten</h4>
-          {records.length === 0 ? <p>Noch keine Einträge</p> : (
+          {records.length === 0 ? (
+            <p>Noch keine Einträge</p>
+          ) : (
             <ul>
-              {records.slice().reverse().slice(0, 20).map((r, i) => (
-                <li key={i}>
-                  {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause abgezogen)" : ""}
-                </li>
-              ))}
+              {records
+                .slice()
+                .reverse()
+                .slice(0, 20)
+                .map((r, i) => (
+                  <li key={i}>
+                    {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min{" "}
+                    {r.lunchApplied ? "(Pause abgezogen)" : ""}
+                  </li>
+                ))}
             </ul>
           )}
 
@@ -391,7 +436,7 @@ export default function App() {
           </div>
           <ul>
             {myVacations.length === 0 && <li>Keine Anträge</li>}
-            {myVacations.map(v => (
+            {myVacations.map((v) => (
               <li key={v.id}>
                 {v.startDate} – {v.endDate} → {v.status}
               </li>
@@ -408,27 +453,42 @@ export default function App() {
 
           <h4 style={{ marginTop: 16 }}>Mitarbeiter</h4>
           <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
-            <input placeholder="Name" value={newEmpName} onChange={(e) => setNewEmpName(e.target.value)} />
-            <input type="password" placeholder="Passwort" value={newEmpPw} onChange={(e) => setNewEmpPw(e.target.value)} />
+            <input
+              placeholder="Name"
+              value={newEmpName}
+              onChange={(e) => setNewEmpName(e.target.value)}
+            />
+            <input
+              type="password"
+              placeholder="Passwort"
+              value={newEmpPw}
+              onChange={(e) => setNewEmpPw(e.target.value)}
+            />
             <button onClick={addEmployee}>Hinzufügen</button>
           </div>
           <ul>
-            {employees.map(emp => (
+            {employees.map((emp) => (
               <li key={emp.id}>
                 {emp.name} {emp.active ? "" : "(inaktiv)"}{" "}
-                <button onClick={() => toggleEmployee(emp.id)}>{emp.active ? "Deaktivieren" : "Aktivieren"}</button>{" "}
-                <button onClick={() => setEmployees(s => s.filter(e => e.id !== emp.id))}>Löschen</button>
+                <button onClick={() => toggleEmployee(emp.id)}>
+                  {emp.active ? "Deaktivieren" : "Aktivieren"}
+                </button>{" "}
+                {/* Optional: Löschfunktion für Mitarbeiter */}
               </li>
             ))}
           </ul>
 
           <h4 style={{ marginTop: 16 }}>Projekte</h4>
           <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
-            <input placeholder="Neues Projekt" value={newProject} onChange={(e) => setNewProject(e.target.value)} />
+            <input
+              placeholder="Neues Projekt"
+              value={newProject}
+              onChange={(e) => setNewProject(e.target.value)}
+            />
             <button onClick={addProject}>Hinzufügen</button>
           </div>
           <ul>
-            {projects.map(p => (
+            {projects.map((p) => (
               <li key={p.id}>
                 {p.name} <button onClick={() => removeProject(p.id)}>Löschen</button>
               </li>
@@ -438,8 +498,8 @@ export default function App() {
           <h4 style={{ marginTop: 16 }}>Urlaubsanträge</h4>
           <ul>
             {vacations.length === 0 && <li>Keine Anträge</li>}
-            {vacations.map(v => {
-              const emp = employees.find(e => e.id === v.employeeId);
+            {vacations.map((v) => {
+              const emp = employees.find((e) => e.id === v.employeeId);
               return (
                 <li key={v.id}>
                   {emp ? emp.name : "?"}: {v.startDate} – {v.endDate} → {v.status}{" "}
@@ -456,21 +516,71 @@ export default function App() {
 
           <h4 style={{ marginTop: 16 }}>Exporte</h4>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button onClick={exportCSV}  disabled={!records.length}>CSV</button>
-            <button onClick={exportExcel} disabled={!records.length}>Excel</button>
-            <button onClick={exportPDF}  disabled={!records.length}>PDF</button>
+            <button onClick={exportCSV} disabled={!records.length}>
+              CSV
+            </button>
+            <button onClick={exportExcel} disabled={!records.length}>
+              Excel
+            </button>
+            <button onClick={exportPDF} disabled={!records.length}>
+              PDF
+            </button>
           </div>
 
           <div style={{ marginTop: 10 }}>
             <label>Logo für PDF: </label>
-            <input type="file" accept="image/*" onChange={(e) => onLogoFile(e.target.files?.[0])} />
+            <input
+              type="file"
+              accept="image/*"
+              onChange={(e) => onLogoFile(e.target.files?.[0])}
+            />
           </div>
 
           <h4 style={{ marginTop: 16 }}>Sicherung</h4>
           <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-            <button onClick={backupAll}>Backup herunterladen (JSON)</button>
+            <button
+              onClick={() => {
+                const payload = {
+                  version: 3,
+                  exportedAt: new Date().toISOString(),
+                  // Stammdaten sind jetzt zentral in Supabase – Backup enthält lokale Daten:
+                  records,
+                  vacations,
+                  logoDataUrl: logoDataUrl || null,
+                };
+                const blob = new Blob([JSON.stringify(payload, null, 2)], {
+                  type: "application/json",
+                });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = "zeiterfassung-backup.json";
+                a.click();
+                URL.revokeObjectURL(url);
+              }}
+            >
+              Backup herunterladen (JSON)
+            </button>
             <label style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-              <input type="file" accept="application/json" onChange={(e) => restoreAllFromFile(e.target.files?.[0])} />
+              <input
+                type="file"
+                accept="application/json"
+                onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  try {
+                    const text = await file.text();
+                    const data = JSON.parse(text);
+                    if (data.records) setRecords(Array.isArray(data.records) ? data.records : []);
+                    if (data.vacations)
+                      setVacations(Array.isArray(data.vacations) ? data.vacations : []);
+                    if (data.logoDataUrl) setLogoDataUrl(String(data.logoDataUrl));
+                    alert("Backup importiert ✅");
+                  } catch (err) {
+                    alert("Import fehlgeschlagen: " + err.message);
+                  }
+                }}
+              />
               Backup importieren (JSON)
             </label>
           </div>
@@ -479,4 +589,3 @@ export default function App() {
     </div>
   );
 }
-
