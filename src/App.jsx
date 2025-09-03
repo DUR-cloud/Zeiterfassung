@@ -5,12 +5,12 @@ import { supabase } from "./supabaseClient";
 
 // ---------- Konstanten ----------
 const LS_KEYS = {
-  records: "zeiterfassung_records_v3",
   logo: "zeiterfassung_logo_v3",
   vacations: "zeiterfassung_vacations_v1",
+  legacy_records: "zeiterfassung_records_v3", // alte lokale Zeiten (für Einmal-Migration)
 };
 
-const ADMIN_FALLBACK = "chef123"; // Admin-Passwort (einfach)
+const ADMIN_FALLBACK = "chef123"; // Admin-Passwort (einfach für Start)
 
 // ---------- Hilfsfunktionen ----------
 const newId = () =>
@@ -62,12 +62,14 @@ export default function App() {
   const [employees, setEmployees] = useState([]);
   const [projects, setProjects] = useState([]);
 
-  // Datenerfassung (lokal)
+  // Zeiten/Records (aus Supabase geladen)
   const [records, setRecords] = useState([]);
-  const [logoDataUrl, setLogoDataUrl] = useState(null);
 
-  // Urlaub (lokal)
+  // Urlaub (lokal – kann später auch zentralisiert werden)
   const [vacations, setVacations] = useState([]);
+
+  // Logo (lokal, nur fürs PDF)
+  const [logoDataUrl, setLogoDataUrl] = useState(null);
 
   // Logins
   const [loginPw, setLoginPw] = useState(""); // Admin
@@ -84,50 +86,59 @@ export default function App() {
   const [newEmpPw, setNewEmpPw] = useState("");
   const [newProject, setNewProject] = useState("");
 
-  // Mitarbeiter: Urlaub beantragen
-  const [vacStart, setVacStart] = useState("");
-  const [vacEnd, setVacEnd] = useState("");
-
   // ---------- Supabase Laden: employees & projects ----------
   useEffect(() => {
     (async () => {
-      const { data, error } = await supabase
-        .from("employees")
-        .select("*")
-        .order("name");
+      const { data, error } = await supabase.from("employees").select("*").order("name");
       if (!error && Array.isArray(data)) setEmployees(data);
     })();
   }, []);
 
   useEffect(() => {
     (async () => {
-      const { data, error } = await supabase
-        .from("projects")
-        .select("*")
-        .order("name");
+      const { data, error } = await supabase.from("projects").select("*").order("name");
       if (!error && Array.isArray(data)) setProjects(data);
     })();
   }, []);
 
-  // ---------- Lokal Laden: records, vacations, logo ----------
+  // ---------- Supabase Laden: records (Zeiten) ----------
+  async function loadRecords() {
+    const { data, error } = await supabase
+      .from("records")
+      .select(`
+        id, employee_id, project_id, start_iso, end_iso, duration_minutes, lunch_applied, created_at,
+        employees:employee_id ( name ),
+        projects:project_id  ( name )
+      `)
+      .order("created_at", { ascending: false });
+
+    if (!error && Array.isArray(data)) {
+      const mapped = data.map((r) => ({
+        id: r.id,
+        employeeId: r.employee_id,
+        projectId: r.project_id,
+        employee: r.employees?.name ?? "",
+        project: r.projects?.name ?? "",
+        date: new Date(r.start_iso).toLocaleDateString(),
+        startISO: r.start_iso,
+        endISO: r.end_iso,
+        duration: r.duration_minutes,
+        lunchApplied: r.lunch_applied,
+      }));
+      setRecords(mapped);
+    }
+  }
+  useEffect(() => { loadRecords(); }, []);
+
+  // ---------- Lokal: Urlaub + Logo ----------
   useEffect(() => {
-    const r = safeParse(localStorage.getItem(LS_KEYS.records), []);
     const v = safeParse(localStorage.getItem(LS_KEYS.vacations), []);
     const l = localStorage.getItem(LS_KEYS.logo) || null;
-    setRecords(Array.isArray(r) ? r : []);
     setVacations(Array.isArray(v) ? v : []);
     setLogoDataUrl(l);
   }, []);
-
-  useEffect(() => {
-    localStorage.setItem(LS_KEYS.records, JSON.stringify(records));
-  }, [records]);
-  useEffect(() => {
-    localStorage.setItem(LS_KEYS.vacations, JSON.stringify(vacations));
-  }, [vacations]);
-  useEffect(() => {
-    if (logoDataUrl) localStorage.setItem(LS_KEYS.logo, logoDataUrl);
-  }, [logoDataUrl]);
+  useEffect(() => { localStorage.setItem(LS_KEYS.vacations, JSON.stringify(vacations)); }, [vacations]);
+  useEffect(() => { if (logoDataUrl) localStorage.setItem(LS_KEYS.logo, logoDataUrl); }, [logoDataUrl]);
 
   // ---------- Logins ----------
   const handleLogin = () => {
@@ -162,13 +173,11 @@ export default function App() {
   const addEmployee = async () => {
     if (!newEmpName.trim() || !newEmpPw.trim()) return alert("Bitte Name & Passwort eingeben");
     const passwordHash = await sha256Hex(newEmpPw);
-
     const { data, error } = await supabase
       .from("employees")
       .insert({ name: newEmpName.trim(), passwordHash, active: true })
       .select()
       .single();
-
     if (error) return alert("Fehler beim Speichern: " + error.message);
     setEmployees((prev) => [...prev, data]);
     setNewEmpName("");
@@ -207,40 +216,65 @@ export default function App() {
     setProjects((prev) => prev.filter((p) => p.id !== id));
   };
 
-  // ---------- Erfassung (lokal) ----------
+  // ---------- Erfassung (Supabase) ----------
   const handleStart = () => {
     if (!currentEmployee) return alert("Bitte als Mitarbeiter einloggen");
     if (!selectedProject) return alert("Bitte Projekt wählen");
     setStartTime(new Date());
   };
 
-  const handleStop = () => {
+  const handleStop = async () => {
     if (!startTime || !currentEmployee) return;
     const end = new Date();
-    const { minutes, lunchApplied } = subtractLunchIfNeeded(
-      startTime.toISOString(),
-      end.toISOString()
-    );
-    const rec = {
-      employee: currentEmployee.name,
-      project: selectedProject,
-      date: fmtDate(startTime),
-      startISO: startTime.toISOString(),
-      endISO: end.toISOString(),
-      duration: minutes,
-      lunchApplied,
+    const { minutes, lunchApplied } = subtractLunchIfNeeded(startTime.toISOString(), end.toISOString());
+
+    // IDs zu Name finden
+    const proj = projects.find((p) => p.name === selectedProject);
+    if (!proj) return alert("Projekt nicht gefunden");
+
+    const { data, error } = await supabase
+      .from("records")
+      .insert({
+        employee_id: currentEmployee.id,
+        project_id: proj.id,
+        start_iso: startTime.toISOString(),
+        end_iso: end.toISOString(),
+        duration_minutes: minutes,
+        lunch_applied: lunchApplied,
+      })
+      .select(`
+        id, employee_id, project_id, start_iso, end_iso, duration_minutes, lunch_applied, created_at,
+        employees:employee_id ( name ),
+        projects:project_id  ( name )
+      `)
+      .single();
+
+    if (error) return alert("Fehler beim Speichern: " + error.message);
+
+    const mapped = {
+      id: data.id,
+      employeeId: data.employee_id,
+      projectId: data.project_id,
+      employee: data.employees?.name ?? "",
+      project: data.projects?.name ?? "",
+      date: new Date(data.start_iso).toLocaleDateString(),
+      startISO: data.start_iso,
+      endISO: data.end_iso,
+      duration: data.duration_minutes,
+      lunchApplied: data.lunch_applied,
     };
-    setRecords((prev) => [...prev, rec]);
+    setRecords((prev) => [mapped, ...prev]);
     setStartTime(null);
   };
 
   // ---------- Urlaub (lokal) ----------
+  const [vacStart, setVacStart] = useState("");
+  const [vacEnd, setVacEnd] = useState("");
+
   const handleVacationRequest = () => {
     if (!currentEmployee) return alert("Bitte einloggen");
     if (!vacStart || !vacEnd) return alert("Bitte Start- und Enddatum wählen");
-    if (new Date(vacEnd) < new Date(vacStart))
-      return alert("Enddatum muss >= Startdatum sein");
-
+    if (new Date(vacEnd) < new Date(vacStart)) return alert("Enddatum muss >= Startdatum sein");
     const newVac = {
       id: newId(),
       employeeId: currentEmployee.id,
@@ -253,80 +287,11 @@ export default function App() {
     setVacEnd("");
   };
   const approveVacation = (id) =>
-    setVacations((prev) =>
-      prev.map((v) => (v.id === id ? { ...v, status: "genehmigt" } : v))
-    );
+    setVacations((prev) => prev.map((v) => (v.id === id ? { ...v, status: "genehmigt" } : v)));
   const rejectVacation = (id) =>
-    setVacations((prev) =>
-      prev.map((v) => (v.id === id ? { ...v, status: "abgelehnt" } : v))
-    );
+    setVacations((prev) => prev.map((v) => (v.id === id ? { ...v, status: "abgelehnt" } : v)));
 
-  // ---------- Exporte ----------
-  const exportCSV = () => {
-    if (!records.length) return;
-    const header = ["Mitarbeiter", "Projekt", "Datum", "Start", "Ende", "Minuten", "Lunch(12-13)"];
-    const rows = records.map((r) => [
-      r.employee,
-      r.project,
-      r.date,
-      fmtTime(r.startISO),
-      fmtTime(r.endISO),
-      String(r.duration ?? ""),
-      r.lunchApplied ? "ja" : "nein",
-    ]);
-    const csv = [header, ...rows].map((row) => row.join(";")).join("\n");
-    const blob = new Blob([csv], { type: "text/csv" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "zeiterfassung.csv";
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const exportExcel = async () => {
-    if (!records.length) return;
-    const XLSX = await import("xlsx");
-    const data = records.map((r) => ({
-      Mitarbeiter: r.employee,
-      Projekt: r.project,
-      Datum: r.date,
-      Start: fmtTime(r.startISO),
-      Ende: fmtTime(r.endISO),
-      Minuten: r.duration ?? "",
-      "Lunch(12-13)": r.lunchApplied ? "ja" : "nein",
-    }));
-    const ws = XLSX.utils.json_to_sheet(data);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Zeiten");
-    XLSX.writeFile(wb, "zeiterfassung.xlsx");
-  };
-
-  const exportPDF = () => {
-    if (!records.length) return;
-    const doc = new jsPDF();
-    if (logoDataUrl) {
-      try {
-        doc.addImage(logoDataUrl, "PNG", 12, 10, 20, 20);
-      } catch {}
-    }
-    doc.setFontSize(16);
-    doc.text("Zeiterfassung Bericht", 40, 22);
-
-    const head = [["Mitarbeiter", "Projekt", "Datum", "Start", "Ende", "Minuten", "Lunch(12-13)"]];
-    const body = records.map((r) => [
-      r.employee,
-      r.project,
-      r.date,
-      fmtTime(r.startISO),
-      fmtTime(r.endISO),
-      String(r.duration ?? ""),
-      r.lunchApplied ? "ja" : "nein",
-    ]);
-    doc.autoTable({ head, body, startY: 36 });
-    doc.save("zeiterfassung.pdf");
-  };
-
+  // ---------- Backup/Restore (nur lokale Daten + Logo) ----------
   const onLogoFile = (file) => {
     if (!file) return;
     const reader = new FileReader();
@@ -334,12 +299,46 @@ export default function App() {
     reader.readAsDataURL(file);
   };
 
+  // Einmal-Migration: lokale alte Zeiten → Supabase
+  const migrateLocalRecordsToSupabase = async () => {
+    const local = safeParse(localStorage.getItem(LS_KEYS.legacy_records), []);
+    if (!Array.isArray(local) || local.length === 0) {
+      alert("Keine lokalen Zeiten gefunden.");
+      return;
+    }
+    if (!confirm(`Es werden ${local.length} lokale Einträge versucht zu migrieren. Fortfahren?`)) return;
+
+    // Map Namen → IDs
+    const empByName = new Map(employees.map((e) => [e.name, e.id]));
+    const projByName = new Map(projects.map((p) => [p.name, p.id]));
+
+    let ok = 0, fail = 0;
+    for (const r of local) {
+      try {
+        const employee_id = empByName.get(r.employee);
+        const project_id = projByName.get(r.project);
+        if (!employee_id || !project_id || !r.startISO || !r.endISO) { fail++; continue; }
+        const { minutes, lunchApplied } = subtractLunchIfNeeded(r.startISO, r.endISO);
+        const { error } = await supabase.from("records").insert({
+          employee_id, project_id,
+          start_iso: r.startISO,
+          end_iso: r.endISO,
+          duration_minutes: minutes,
+          lunch_applied: lunchApplied,
+        });
+        if (error) { fail++; continue; }
+        ok++;
+      } catch {
+        fail++;
+      }
+    }
+    await loadRecords();
+    alert(`Migration abgeschlossen: ${ok} importiert, ${fail} übersprungen.`);
+  };
+
   // Anzeige-Hilfen
   const myVacations = useMemo(
-    () =>
-      currentEmployee
-        ? vacations.filter((v) => v.employeeId === currentEmployee.id)
-        : [],
+    () => (currentEmployee ? vacations.filter((v) => v.employeeId === currentEmployee.id) : []),
     [vacations, currentEmployee]
   );
 
@@ -353,28 +352,14 @@ export default function App() {
           <h3>Login</h3>
           <div style={{ display: "grid", gap: 8, maxWidth: 360 }}>
             <strong>Mitarbeiter</strong>
-            <input
-              placeholder="Name"
-              value={loginName}
-              onChange={(e) => setLoginName(e.target.value)}
-            />
-            <input
-              type="password"
-              placeholder="Passwort"
-              value={empPw}
-              onChange={(e) => setEmpPw(e.target.value)}
-            />
+            <input placeholder="Name" value={loginName} onChange={(e) => setLoginName(e.target.value)} />
+            <input type="password" placeholder="Passwort" value={empPw} onChange={(e) => setEmpPw(e.target.value)} />
             <button onClick={handleEmployeeLogin}>Mitarbeiter Login</button>
 
             <div style={{ margin: "8px 0", opacity: 0.6 }}>— oder —</div>
 
             <strong>Admin</strong>
-            <input
-              type="password"
-              placeholder="Admin-Passwort"
-              value={loginPw}
-              onChange={(e) => setLoginPw(e.target.value)}
-            />
+            <input type="password" placeholder="Admin-Passwort" value={loginPw} onChange={(e) => setLoginPw(e.target.value)} />
             <button onClick={handleLogin}>Admin Login</button>
           </div>
         </section>
@@ -384,28 +369,17 @@ export default function App() {
       {role === "employee" && currentEmployee && (
         <section style={{ marginTop: 16 }}>
           <h3>Zeiterfassung für {currentEmployee.name}</h3>
-          <button onClick={handleLogout} style={{ marginBottom: 8 }}>
-            Logout
-          </button>
+          <button onClick={handleLogout} style={{ marginBottom: 8 }}>Logout</button>
 
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-            <select
-              value={selectedProject}
-              onChange={(e) => setSelectedProject(e.target.value)}
-            >
+            <select value={selectedProject} onChange={(e) => setSelectedProject(e.target.value)}>
               <option value="">Projekt wählen</option>
               {projects.map((p) => (
-                <option key={p.id} value={p.name}>
-                  {p.name}
-                </option>
+                <option key={p.id} value={p.name}>{p.name}</option>
               ))}
             </select>
-            <button onClick={handleStart} disabled={!selectedProject || !!startTime}>
-              Start
-            </button>
-            <button onClick={handleStop} disabled={!startTime}>
-              Stop
-            </button>
+            <button onClick={handleStart} disabled={!selectedProject || !!startTime}>Start</button>
+            <button onClick={handleStop} disabled={!startTime}>Stop</button>
             {startTime && <span>Gestartet: {fmtTime(startTime.toISOString())}</span>}
           </div>
 
@@ -414,16 +388,11 @@ export default function App() {
             <p>Noch keine Einträge</p>
           ) : (
             <ul>
-              {records
-                .slice()
-                .reverse()
-                .slice(0, 20)
-                .map((r, i) => (
-                  <li key={i}>
-                    {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min{" "}
-                    {r.lunchApplied ? "(Pause abgezogen)" : ""}
-                  </li>
-                ))}
+              {records.map((r) => (
+                <li key={r.id}>
+                  {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause abgezogen)" : ""}
+                </li>
+              ))}
             </ul>
           )}
 
@@ -437,9 +406,7 @@ export default function App() {
           <ul>
             {myVacations.length === 0 && <li>Keine Anträge</li>}
             {myVacations.map((v) => (
-              <li key={v.id}>
-                {v.startDate} – {v.endDate} → {v.status}
-              </li>
+              <li key={v.id}>{v.startDate} – {v.endDate} → {v.status}</li>
             ))}
           </ul>
         </section>
@@ -453,38 +420,22 @@ export default function App() {
 
           <h4 style={{ marginTop: 16 }}>Mitarbeiter</h4>
           <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
-            <input
-              placeholder="Name"
-              value={newEmpName}
-              onChange={(e) => setNewEmpName(e.target.value)}
-            />
-            <input
-              type="password"
-              placeholder="Passwort"
-              value={newEmpPw}
-              onChange={(e) => setNewEmpPw(e.target.value)}
-            />
+            <input placeholder="Name" value={newEmpName} onChange={(e) => setNewEmpName(e.target.value)} />
+            <input type="password" placeholder="Passwort" value={newEmpPw} onChange={(e) => setNewEmpPw(e.target.value)} />
             <button onClick={addEmployee}>Hinzufügen</button>
           </div>
           <ul>
             {employees.map((emp) => (
               <li key={emp.id}>
                 {emp.name} {emp.active ? "" : "(inaktiv)"}{" "}
-                <button onClick={() => toggleEmployee(emp.id)}>
-                  {emp.active ? "Deaktivieren" : "Aktivieren"}
-                </button>{" "}
-                {/* Optional: Löschfunktion für Mitarbeiter */}
+                <button onClick={() => toggleEmployee(emp.id)}>{emp.active ? "Deaktivieren" : "Aktivieren"}</button>
               </li>
             ))}
           </ul>
 
           <h4 style={{ marginTop: 16 }}>Projekte</h4>
           <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
-            <input
-              placeholder="Neues Projekt"
-              value={newProject}
-              onChange={(e) => setNewProject(e.target.value)}
-            />
+            <input placeholder="Neues Projekt" value={newProject} onChange={(e) => setNewProject(e.target.value)} />
             <button onClick={addProject}>Hinzufügen</button>
           </div>
           <ul>
@@ -494,6 +445,91 @@ export default function App() {
               </li>
             ))}
           </ul>
+
+          <h4 style={{ marginTop: 16 }}>Zeiten</h4>
+          {records.length === 0 ? <p>Keine Einträge</p> : (
+            <ul>
+              {records.map((r) => (
+                <li key={r.id}>
+                  {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause abgezogen)" : ""}
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <h4 style={{ marginTop: 16 }}>Exporte</h4>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button
+              onClick={async () => {
+                if (!records.length) return;
+                const header = ["Mitarbeiter", "Projekt", "Datum", "Start", "Ende", "Minuten", "Lunch(12-13)"];
+                const rows = records.map((r) => [
+                  r.employee, r.project, r.date,
+                  fmtTime(r.startISO), fmtTime(r.endISO),
+                  String(r.duration ?? ""), r.lunchApplied ? "ja" : "nein",
+                ]);
+                const csv = [header, ...rows].map((row) => row.join(";")).join("\n");
+                const blob = new Blob([csv], { type: "text/csv" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url; a.download = "zeiterfassung.csv"; a.click();
+                URL.revokeObjectURL(url);
+              }}
+              disabled={!records.length}
+            >
+              CSV
+            </button>
+            <button
+              onClick={async () => {
+                if (!records.length) return;
+                const XLSX = await import("xlsx");
+                const data = records.map((r) => ({
+                  Mitarbeiter: r.employee,
+                  Projekt: r.project,
+                  Datum: r.date,
+                  Start: fmtTime(r.startISO),
+                  Ende: fmtTime(r.endISO),
+                  Minuten: r.duration ?? "",
+                  "Lunch(12-13)": r.lunchApplied ? "ja" : "nein",
+                }));
+                const ws = XLSX.utils.json_to_sheet(data);
+                const wb = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(wb, ws, "Zeiten");
+                XLSX.writeFile(wb, "zeiterfassung.xlsx");
+              }}
+              disabled={!records.length}
+            >
+              Excel
+            </button>
+            <button
+              onClick={() => {
+                if (!records.length) return;
+                const doc = new jsPDF();
+                if (logoDataUrl) { try { doc.addImage(logoDataUrl, "PNG", 12, 10, 20, 20); } catch {} }
+                doc.setFontSize(16); doc.text("Zeiterfassung Bericht", 40, 22);
+                const head = [["Mitarbeiter", "Projekt", "Datum", "Start", "Ende", "Minuten", "Lunch(12-13)"]];
+                const body = records.map((r) => [
+                  r.employee, r.project, r.date,
+                  fmtTime(r.startISO), fmtTime(r.endISO),
+                  String(r.duration ?? ""), r.lunchApplied ? "ja" : "nein",
+                ]);
+                doc.autoTable({ head, body, startY: 36 }); doc.save("zeiterfassung.pdf");
+              }}
+              disabled={!records.length}
+            >
+              PDF
+            </button>
+          </div>
+
+          <div style={{ marginTop: 10 }}>
+            <label>Logo für PDF: </label>
+            <input type="file" accept="image/*" onChange={(e) => onLogoFile(e.target.files?.[0])} />
+          </div>
+
+          <h4 style={{ marginTop: 16 }}>Daten-Werkzeuge</h4>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <button onClick={migrateLocalRecordsToSupabase}>Lokale Zeiten → Supabase (einmalig)</button>
+          </div>
 
           <h4 style={{ marginTop: 16 }}>Urlaubsanträge</h4>
           <ul>
@@ -513,77 +549,6 @@ export default function App() {
               );
             })}
           </ul>
-
-          <h4 style={{ marginTop: 16 }}>Exporte</h4>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button onClick={exportCSV} disabled={!records.length}>
-              CSV
-            </button>
-            <button onClick={exportExcel} disabled={!records.length}>
-              Excel
-            </button>
-            <button onClick={exportPDF} disabled={!records.length}>
-              PDF
-            </button>
-          </div>
-
-          <div style={{ marginTop: 10 }}>
-            <label>Logo für PDF: </label>
-            <input
-              type="file"
-              accept="image/*"
-              onChange={(e) => onLogoFile(e.target.files?.[0])}
-            />
-          </div>
-
-          <h4 style={{ marginTop: 16 }}>Sicherung</h4>
-          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-            <button
-              onClick={() => {
-                const payload = {
-                  version: 3,
-                  exportedAt: new Date().toISOString(),
-                  // Stammdaten sind jetzt zentral in Supabase – Backup enthält lokale Daten:
-                  records,
-                  vacations,
-                  logoDataUrl: logoDataUrl || null,
-                };
-                const blob = new Blob([JSON.stringify(payload, null, 2)], {
-                  type: "application/json",
-                });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement("a");
-                a.href = url;
-                a.download = "zeiterfassung-backup.json";
-                a.click();
-                URL.revokeObjectURL(url);
-              }}
-            >
-              Backup herunterladen (JSON)
-            </button>
-            <label style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-              <input
-                type="file"
-                accept="application/json"
-                onChange={async (e) => {
-                  const file = e.target.files?.[0];
-                  if (!file) return;
-                  try {
-                    const text = await file.text();
-                    const data = JSON.parse(text);
-                    if (data.records) setRecords(Array.isArray(data.records) ? data.records : []);
-                    if (data.vacations)
-                      setVacations(Array.isArray(data.vacations) ? data.vacations : []);
-                    if (data.logoDataUrl) setLogoDataUrl(String(data.logoDataUrl));
-                    alert("Backup importiert ✅");
-                  } catch (err) {
-                    alert("Import fehlgeschlagen: " + err.message);
-                  }
-                }}
-              />
-              Backup importieren (JSON)
-            </label>
-          </div>
         </section>
       )}
     </div>
