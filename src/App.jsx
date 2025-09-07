@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { jsPDF } from "jspdf";
 import "jspdf-autotable";
-import { supabase } from "./supabaseClient";
+import { supabase } from "./supabaseClient.js"; // Endung .js angeben
+
 
 // ---------- Konstanten ----------
 const LS_KEYS = {
