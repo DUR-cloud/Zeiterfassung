@@ -139,6 +139,55 @@ export default function App() {
   }, []);
   useEffect(() => { localStorage.setItem(LS_KEYS.vacations, JSON.stringify(vacations)); }, [vacations]);
   useEffect(() => { if (logoDataUrl) localStorage.setItem(LS_KEYS.logo, logoDataUrl); }, [logoDataUrl]);
+// ⬇️ Live-Updates via Supabase Realtime
+useEffect(() => {
+  const reloadAll = async () => {
+    // Falls du schon eigene load*-Funktionen hast, ruf die hier auf.
+    // Sonst einfach deine select()-Abfragen von oben nochmal ausführen.
+    try {
+      const [empRes, projRes, recRes] = await Promise.all([
+        supabase.from("employees").select("*").order("name"),
+        supabase.from("projects").select("*").order("name"),
+        supabase
+          .from("records")
+          .select("*, employees(name), projects(name)")
+          .order("created_at", { ascending: false }),
+      ]);
+
+      if (!empRes.error) setEmployees(empRes.data ?? []);
+      if (!projRes.error) setProjects(projRes.data ?? []);
+      if (!recRes.error) {
+        setRecords(
+          (recRes.data ?? []).map(r => ({
+            employee: r.employees?.name ?? "",
+            project:  r.projects?.name ?? "",
+            date: new Date(r.start_iso).toLocaleDateString(),
+            startISO: r.start_iso,
+            endISO:   r.end_iso,
+            duration: r.duration_minutes,
+            lunchApplied: r.lunch_applied
+          }))
+        );
+      }
+    } catch {}
+  };
+
+  // Realtime-Abo: records, projects, employees
+  const channel = supabase
+    .channel("realtime-all")
+    .on("postgres_changes", { event: "*", schema: "public", table: "records"  }, reloadAll)
+    .on("postgres_changes", { event: "*", schema: "public", table: "projects" }, reloadAll)
+    .on("postgres_changes", { event: "*", schema: "public", table: "employees"}, reloadAll)
+    .subscribe();
+
+  // Fallback: alle 10s nachladen (falls Realtime aus ist)
+  const poll = setInterval(reloadAll, 10000);
+
+  return () => {
+    supabase.removeChannel(channel);
+    clearInterval(poll);
+  };
+}, []);
 
   // ---------- Logins ----------
   const handleLogin = () => {
