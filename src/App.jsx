@@ -202,7 +202,7 @@ useEffect(() => {
     const emp = employees.find((e) => e.name === loginName && e.active !== false);
     if (!emp) return alert("Mitarbeiter nicht gefunden oder deaktiviert");
     const hash = await sha256Hex(empPw);
-    if (emp.passwordHash === hash) {
+    if (emp.password_hash === hash) {
       setRole("employee");
       setCurrentEmployee(emp);
       setLoginName("");
@@ -225,7 +225,7 @@ useEffect(() => {
     const passwordHash = await sha256Hex(newEmpPw);
     const { data, error } = await supabase
       .from("employees")
-      .insert({ name: newEmpName.trim(), passwordHash, active: true })
+      .insert({ name: newEmpName.trim(), password_hash: passwordHash, active: true })
       .select()
       .single();
     if (error) return alert("Fehler beim Speichern: " + error.message);
