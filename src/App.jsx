@@ -1,8 +1,8 @@
+// src/App.jsx
 import { useEffect, useMemo, useState } from "react";
 import { jsPDF } from "jspdf";
 import "jspdf-autotable";
-import { supabase } from "./supabaseClient.js"; // Endung .js angeben
-
+import { supabase } from "./supabaseClient.js";
 
 // ---------- Konstanten ----------
 const LS_KEYS = {
@@ -60,7 +60,7 @@ export default function App() {
   const [role, setRole] = useState(null);
 
   // Stammdaten (Supabase)
-  const [employees, setEmployees] = useState([]);
+  const [employees, setEmployees] = useState([]); // enthält auch note, password_hash, active
   const [projects, setProjects] = useState([]);
 
   // Zeiten/Records (aus Supabase geladen)
@@ -86,6 +86,9 @@ export default function App() {
   const [newEmpName, setNewEmpName] = useState("");
   const [newEmpPw, setNewEmpPw] = useState("");
   const [newProject, setNewProject] = useState("");
+
+  // Mitarbeiter-Notiz (lokaler UI-State gespiegelt zu Supabase)
+  const [myNoteDraft, setMyNoteDraft] = useState("");
 
   // ---------- Supabase Laden: employees & projects ----------
   useEffect(() => {
@@ -140,55 +143,69 @@ export default function App() {
   }, []);
   useEffect(() => { localStorage.setItem(LS_KEYS.vacations, JSON.stringify(vacations)); }, [vacations]);
   useEffect(() => { if (logoDataUrl) localStorage.setItem(LS_KEYS.logo, logoDataUrl); }, [logoDataUrl]);
-// ⬇️ Live-Updates via Supabase Realtime
-useEffect(() => {
-  const reloadAll = async () => {
-    // Falls du schon eigene load*-Funktionen hast, ruf die hier auf.
-    // Sonst einfach deine select()-Abfragen von oben nochmal ausführen.
-    try {
-      const [empRes, projRes, recRes] = await Promise.all([
-        supabase.from("employees").select("*").order("name"),
-        supabase.from("projects").select("*").order("name"),
-        supabase
-          .from("records")
-          .select("*, employees(name), projects(name)")
-          .order("created_at", { ascending: false }),
-      ]);
 
-      if (!empRes.error) setEmployees(empRes.data ?? []);
-      if (!projRes.error) setProjects(projRes.data ?? []);
-      if (!recRes.error) {
-        setRecords(
-          (recRes.data ?? []).map(r => ({
-            employee: r.employees?.name ?? "",
-            project:  r.projects?.name ?? "",
-            date: new Date(r.start_iso).toLocaleDateString(),
-            startISO: r.start_iso,
-            endISO:   r.end_iso,
-            duration: r.duration_minutes,
-            lunchApplied: r.lunch_applied
-          }))
-        );
-      }
-    } catch {}
-  };
+  // ⬇️ Live-Updates via Supabase Realtime (+ Fallback Poll)
+  useEffect(() => {
+    const reloadAll = async () => {
+      try {
+        const [empRes, projRes, recRes] = await Promise.all([
+          supabase.from("employees").select("*").order("name"),
+          supabase.from("projects").select("*").order("name"),
+          supabase
+            .from("records")
+            .select(`
+              id, employee_id, project_id, start_iso, end_iso, duration_minutes, lunch_applied, created_at,
+              employees:employee_id ( name ),
+              projects:project_id  ( name )
+            `)
+            .order("created_at", { ascending: false }),
+        ]);
 
-  // Realtime-Abo: records, projects, employees
-  const channel = supabase
-    .channel("realtime-all")
-    .on("postgres_changes", { event: "*", schema: "public", table: "records"  }, reloadAll)
-    .on("postgres_changes", { event: "*", schema: "public", table: "projects" }, reloadAll)
-    .on("postgres_changes", { event: "*", schema: "public", table: "employees"}, reloadAll)
-    .subscribe();
+        if (!empRes.error) {
+          setEmployees(empRes.data ?? []);
+          // falls der aktuelle Mitarbeiter betroffen ist → Notiz-Entwurf aktualisieren
+          if (currentEmployee) {
+            const freshMe = (empRes.data ?? []).find(e => e.id === currentEmployee.id);
+            if (freshMe) {
+              setCurrentEmployee(freshMe);
+              setMyNoteDraft(freshMe.note ?? "");
+            }
+          }
+        }
+        if (!projRes.error) setProjects(projRes.data ?? []);
+        if (!recRes.error) {
+          setRecords(
+            (recRes.data ?? []).map(r => ({
+              id: r.id,
+              employeeId: r.employee_id,
+              projectId: r.project_id,
+              employee: r.employees?.name ?? "",
+              project: r.projects?.name ?? "",
+              date: new Date(r.start_iso).toLocaleDateString(),
+              startISO: r.start_iso,
+              endISO: r.end_iso,
+              duration: r.duration_minutes,
+              lunchApplied: r.lunch_applied
+            }))
+          );
+        }
+      } catch {}
+    };
 
-  // Fallback: alle 10s nachladen (falls Realtime aus ist)
-  const poll = setInterval(reloadAll, 10000);
+    const channel = supabase
+      .channel("realtime-all")
+      .on("postgres_changes", { event: "*", schema: "public", table: "employees" }, reloadAll)
+      .on("postgres_changes", { event: "*", schema: "public", table: "projects"  }, reloadAll)
+      .on("postgres_changes", { event: "*", schema: "public", table: "records"   }, reloadAll)
+      .subscribe();
 
-  return () => {
-    supabase.removeChannel(channel);
-    clearInterval(poll);
-  };
-}, []);
+    const poll = setInterval(reloadAll, 10000);
+
+    return () => {
+      supabase.removeChannel(channel);
+      clearInterval(poll);
+    };
+  }, [currentEmployee]);
 
   // ---------- Logins ----------
   const handleLogin = () => {
@@ -207,6 +224,7 @@ useEffect(() => {
       setCurrentEmployee(emp);
       setLoginName("");
       setEmpPw("");
+      setMyNoteDraft(emp.note ?? "");
     } else {
       alert("Falsches Passwort");
     }
@@ -217,6 +235,7 @@ useEffect(() => {
     setCurrentEmployee(null);
     setSelectedProject("");
     setStartTime(null);
+    setMyNoteDraft("");
   };
 
   // ---------- Mitarbeiter (Supabase) ----------
@@ -225,7 +244,7 @@ useEffect(() => {
     const passwordHash = await sha256Hex(newEmpPw);
     const { data, error } = await supabase
       .from("employees")
-      .insert({ name: newEmpName.trim(), password_hash: passwordHash, active: true })
+      .insert({ name: newEmpName.trim(), password_hash: passwordHash, active: true, note: "" })
       .select()
       .single();
     if (error) return alert("Fehler beim Speichern: " + error.message);
@@ -245,6 +264,7 @@ useEffect(() => {
       .single();
     if (error) return alert("Fehler: " + error.message);
     setEmployees((prev) => prev.map((e) => (e.id === id ? data : e)));
+    if (currentEmployee?.id === id) setCurrentEmployee(data);
   };
 
   // ---------- Projekte (Supabase) ----------
@@ -356,7 +376,7 @@ useEffect(() => {
       alert("Keine lokalen Zeiten gefunden.");
       return;
     }
-    if (!confirm(`Es werden ${local.length} lokale Einträge versucht zu migrieren. Fortfahren?`)) return;
+    if (!confirm(`Es werden ${local.length} lokale Einträge migriert. Fortfahren?`)) return;
 
     // Map Namen → IDs
     const empByName = new Map(employees.map((e) => [e.name, e.id]));
@@ -391,6 +411,25 @@ useEffect(() => {
     () => (currentEmployee ? vacations.filter((v) => v.employeeId === currentEmployee.id) : []),
     [vacations, currentEmployee]
   );
+
+  // ---------- Notiz speichern (Mitarbeiter) ----------
+  const saveMyNote = async () => {
+    if (!currentEmployee) return;
+    const { data, error } = await supabase
+      .from("employees")
+      .update({ note: myNoteDraft })
+      .eq("id", currentEmployee.id)
+      .select()
+      .single();
+    if (error) {
+      alert("Fehler beim Speichern der Notiz: " + error.message);
+      return;
+    }
+    // State aktualisieren (Liste + aktueller Mitarbeiter)
+    setEmployees(prev => prev.map(e => e.id === data.id ? data : e));
+    setCurrentEmployee(data);
+    setMyNoteDraft(data.note ?? "");
+  };
 
   return (
     <div style={{ padding: 16, maxWidth: 980, margin: "0 auto" }}>
@@ -459,6 +498,22 @@ useEffect(() => {
               <li key={v.id}>{v.startDate} – {v.endDate} → {v.status}</li>
             ))}
           </ul>
+
+          {/* Notizfeld */}
+          <h4 style={{ marginTop: 16 }}>Meine Notiz</h4>
+          <textarea
+            value={myNoteDraft}
+            onChange={(e) => setMyNoteDraft(e.target.value)}
+            rows={3}
+            style={{ width: "100%" }}
+            placeholder="Schreibe hier deine Notiz (z. B. Außendienst, krank, Einsatzort …)"
+          />
+          <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
+            <button onClick={saveMyNote}>Notiz speichern</button>
+            <span style={{ opacity: 0.7 }}>
+              Sichtbar für Admin in der Mitarbeiterliste
+            </span>
+          </div>
         </section>
       )}
 
@@ -476,9 +531,18 @@ useEffect(() => {
           </div>
           <ul>
             {employees.map((emp) => (
-              <li key={emp.id}>
-                {emp.name} {emp.active ? "" : "(inaktiv)"}{" "}
-                <button onClick={() => toggleEmployee(emp.id)}>{emp.active ? "Deaktivieren" : "Aktivieren"}</button>
+              <li key={emp.id} style={{ marginBottom: 8 }}>
+                <div>
+                  <strong>{emp.name}</strong> {emp.active ? "" : "(inaktiv)"}
+                  <div style={{ fontSize: 13, opacity: 0.8 }}>
+                    <em>Notiz:</em> {emp.note?.trim() ? emp.note : "—"}
+                  </div>
+                </div>
+                <div style={{ marginTop: 4 }}>
+                  <button onClick={() => toggleEmployee(emp.id)}>
+                    {emp.active ? "Deaktivieren" : "Aktivieren"}
+                  </button>
+                </div>
               </li>
             ))}
           </ul>
