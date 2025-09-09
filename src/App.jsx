@@ -81,6 +81,7 @@ export default function App() {
   // Auswahl/Erfassung
   const [selectedProject, setSelectedProject] = useState("");
   const [startTime, setStartTime] = useState(null);
+  const [workNote, setWorkNote] = useState(""); // <<<<<< Mitarbeiter-Notiz pro Zeitbuchung
 
   // Admin-Form „Neuer Mitarbeiter/Projekt“
   const [newEmpName, setNewEmpName] = useState("");
@@ -89,7 +90,7 @@ export default function App() {
   const [newProject, setNewProject] = useState("");
   const [newProjectNote, setNewProjectNote] = useState("");
 
-  // Inline-Editing der Projekt-Notizen
+  // Inline-Editing der Projekt-Notizen (Admin)
   const [editNotes, setEditNotes] = useState({}); // { [projectId]: "text" }
 
   // Urlaubseingabe
@@ -118,7 +119,7 @@ export default function App() {
     const { data, error } = await supabase
       .from("records")
       .select(`
-        id, employee_id, project_id, start_iso, end_iso, duration_minutes, lunch_applied, created_at,
+        id, employee_id, project_id, start_iso, end_iso, duration_minutes, lunch_applied, work_note, created_at,
         employees:employee_id ( name ),
         projects:project_id  ( name, note )
       `)
@@ -136,6 +137,7 @@ export default function App() {
         endISO: r.end_iso,
         duration: r.duration_minutes,
         lunchApplied: r.lunch_applied,
+        workNote: r.work_note ?? "",
       }));
       setRecords(mapped);
     }
@@ -191,7 +193,7 @@ export default function App() {
   const handleEmployeeLogin = async () => {
     const emp = employees.find((e) => e.name === loginName && e.active !== false);
     if (!emp) return alert("Mitarbeiter nicht gefunden oder deaktiviert");
-    // ACHTUNG: in DB Spalte 'password_hash' verwenden (snake_case)
+    // in DB Spalte 'password_hash' verwenden (snake_case)
     const hash = await sha256Hex(empPw);
     if (emp.password_hash === hash) {
       setRole("employee");
@@ -208,6 +210,7 @@ export default function App() {
     setCurrentEmployee(null);
     setSelectedProject("");
     setStartTime(null);
+    setWorkNote("");
   };
 
 // ---------- Mitarbeiter (Supabase) ----------
@@ -240,17 +243,17 @@ export default function App() {
 
 // ---------- Projekte (Supabase) ----------
   const addProject = async () => {
-  if (!newProject.trim()) return;
-  const { data, error } = await supabase
-    .from("projects")
-    .insert({ name: newProject.trim(), note: "" }) // <- note dazu
-    .select()
-    .single();
-  if (error) return alert("Fehler beim Speichern: " + error.message);
-  setProjects(prev => [...prev, data]);
-  setNewProject("");
-};
-
+    if (!newProject.trim()) return;
+    const { data, error } = await supabase
+      .from("projects")
+      .insert({ name: newProject.trim(), note: newProjectNote.trim() })
+      .select()
+      .single();
+    if (error) return alert("Fehler beim Speichern: " + error.message);
+    setProjects(prev => [...prev, data]);
+    setNewProject("");
+    setNewProjectNote("");
+  };
 
   const saveProjectNote = async (projectId) => {
     const note = (editNotes[projectId] ?? "").trim();
@@ -273,38 +276,74 @@ export default function App() {
     const { error } = await supabase.from("projects").delete().eq("id", id);
     if (error) return alert("Fehler beim Löschen: " + error.message);
     setProjects((prev) => prev.filter((p) => p.id !== id));
-// --- Projekt-Notiz State ---
-const [selectedProjectId, setSelectedProjectId] = useState("");
-const [projectNote, setProjectNote] = useState("");
-
-// Wenn Auswahl wechselt, Text aus aktuellem Projekt übernehmen
-useEffect(() => {
-  if (!selectedProjectId) { setProjectNote(""); return; }
-  const p = projects.find(pr => pr.id === selectedProjectId);
-  setProjectNote(p?.note ?? "");
-}, [selectedProjectId, projects]);
-
-// Notiz speichern
-async function saveProjectNote() {
-  if (!selectedProjectId) return alert("Bitte Projekt wählen");
-  const { data, error } = await supabase
-    .from("projects")
-    .update({ note: projectNote })
-    .eq("id", selectedProjectId)
-    .select()
-    .single();
-  if (error) return alert("Fehler beim Speichern: " + error.message);
-  // lokalen State aktualisieren
-  setProjects(prev => prev.map(p => p.id === data.id ? data : p));
-  alert("Notiz gespeichert ✅");
-}
   };
+// ---------- Notiz nachträglich bearbeiten (nur eigene Records) ----------
+const [editNoteId, setEditNoteId] = useState(null);
+const [editNoteText, setEditNoteText] = useState("");
+
+function startEditNote(rec) {
+  setEditNoteId(rec.id);
+  setEditNoteText(rec.workNote || "");
+}
+
+async function saveEditNote() {
+  if (!editNoteId) return;
+  const { data, error } = await supabase
+    .from("records")
+    .update({ work_note: editNoteText.trim() || null })
+    .eq("id", editNoteId)
+    .select(`
+      id, work_note,
+      employee_id,
+      project_id,
+      start_iso, end_iso, duration_minutes, lunch_applied, created_at,
+      employees:employee_id ( name ),
+      projects:project_id  ( name, note )
+    `)
+    .single();
+
+  if (error) {
+    alert("Fehler beim Speichern der Notiz: " + error.message);
+    return;
+  }
+
+  // lokalen State aktualisieren
+  setRecords(prev =>
+    prev.map(r =>
+      r.id === data.id
+        ? {
+            ...r,
+            employeeId: data.employee_id,
+            projectId:  data.project_id,
+            employee:   data.employees?.name ?? r.employee,
+            project:    data.projects?.name ?? r.project,
+            date:       new Date(data.start_iso).toLocaleDateString(),
+            startISO:   data.start_iso,
+            endISO:     data.end_iso,
+            duration:   data.duration_minutes,
+            lunchApplied: data.lunch_applied,
+            workNote:   data.work_note ?? "",
+          }
+        : r
+    )
+  );
+
+  setEditNoteId(null);
+  setEditNoteText("");
+}
+
+function cancelEditNote() {
+  setEditNoteId(null);
+  setEditNoteText("");
+}
 
 // ---------- Erfassung (Supabase) ----------
   const handleStart = () => {
     if (!currentEmployee) return alert("Bitte als Mitarbeiter einloggen");
     if (!selectedProject) return alert("Bitte Projekt wählen");
     setStartTime(new Date());
+    // Optional: vorhandene Notiz beim Start leeren
+    setWorkNote("");
   };
 
   const handleStop = async () => {
@@ -325,9 +364,10 @@ async function saveProjectNote() {
         end_iso: end.toISOString(),
         duration_minutes: minutes,
         lunch_applied: lunchApplied,
+        work_note: workNote.trim() || null, // <<<<<< Notiz speichern
       })
       .select(`
-        id, employee_id, project_id, start_iso, end_iso, duration_minutes, lunch_applied, created_at,
+        id, employee_id, project_id, start_iso, end_iso, duration_minutes, lunch_applied, work_note, created_at,
         employees:employee_id ( name ),
         projects:project_id  ( name, note )
       `)
@@ -346,9 +386,11 @@ async function saveProjectNote() {
       endISO: data.end_iso,
       duration: data.duration_minutes,
       lunchApplied: data.lunch_applied,
+      workNote: data.work_note ?? "",
     };
     setRecords((prev) => [mapped, ...prev]);
     setStartTime(null);
+    setWorkNote("");
   };
 
 // ---------- Urlaub (lokal) ----------
@@ -405,6 +447,7 @@ async function saveProjectNote() {
           end_iso: r.endISO,
           duration_minutes: minutes,
           lunch_applied: lunchApplied,
+          work_note: r.workNote ?? null,
         });
         if (error) { fail++; continue; }
         ok++;
@@ -468,51 +511,80 @@ async function saveProjectNote() {
             {startTime && <span>Gestartet: {fmtTime(startTime.toISOString())}</span>}
           </div>
 
-          {/* Projekt-Notiz anzeigen */}
+          {/* Projekt-Notiz (vom Admin, nur Anzeige) */}
           {selectedProjectObj && (
             <div style={{ marginTop: 8, padding: 8, background: "#f6f6f6", borderRadius: 6 }}>
-              <strong>Projekt-Notiz:</strong>{" "}
+              <strong>Projekt-Notiz (Admin):</strong>{" "}
               <span>{selectedProjectObj.note || "—"}</span>
             </div>
           )}
-<h4 style={{ marginTop: 16 }}>Projekt-Notiz</h4>
-<div style={{ display: "grid", gap: 8, maxWidth: 600 }}>
-  <select
-    value={selectedProjectId}
-    onChange={(e) => setSelectedProjectId(e.target.value)}
-  >
-    <option value="">Projekt wählen</option>
-    {projects.map(p => (
-      <option key={p.id} value={p.id}>{p.name}</option>
-    ))}
-  </select>
 
-  <textarea
-    rows={4}
-    placeholder="Notiz zum ausgewählten Projekt…"
-    value={projectNote}
-    onChange={(e) => setProjectNote(e.target.value)}
-    disabled={!selectedProjectId}
-    style={{ width: "100%", resize: "vertical" }}
-  />
-
-  <button onClick={saveProjectNote} disabled={!selectedProjectId}>
-    Notiz speichern
-  </button>
-</div>
+          {/* Mitarbeiter-Notiz zur laufenden Buchung */}
+          <div style={{ marginTop: 12 }}>
+            <label style={{ display: "block", fontSize: 12, opacity: 0.7, marginBottom: 4 }}>
+              Deine Notiz zur Zeitbuchung (sichtbar für Admin)
+            </label>
+            <textarea
+              rows={3}
+              placeholder="Kurz beschreiben, was erledigt wurde…"
+              value={workNote}
+              onChange={(e) => setWorkNote(e.target.value)}
+              disabled={!selectedProject || !startTime} // Notiz zur *laufenden* Buchung
+              style={{ width: "100%", resize: "vertical" }}
+            />
+          </div>
 
           <h4 style={{ marginTop: 16 }}>Zuletzt erfasste Zeiten</h4>
-          {records.length === 0 ? (
-            <p>Noch keine Einträge</p>
+{records.length === 0 ? (
+  <p>Noch keine Einträge</p>
+) : (
+  <ul>
+    {records.map((r) => {
+      const isOwn = currentEmployee && r.employeeId === currentEmployee.id;
+      const isEditing = editNoteId === r.id;
+
+      return (
+        <li key={r.id} style={{ marginBottom: 10 }}>
+          <div>
+            {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause abgezogen)" : ""}
+          </div>
+
+          {/* Anzeige ODER Editor */}
+          {!isEditing ? (
+            <div style={{ marginTop: 4 }}>
+              <div style={{ fontSize: 13, opacity: 0.9 }}>
+                <strong>Notiz:</strong> {r.workNote ? r.workNote : "—"}
+              </div>
+              {isOwn && (
+                <button
+                  style={{ marginTop: 4 }}
+                  onClick={() => startEditNote(r)}
+                >
+                  Notiz bearbeiten
+                </button>
+              )}
+            </div>
           ) : (
-            <ul>
-              {records.map((r) => (
-                <li key={r.id}>
-                  {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause abgezogen)" : ""}
-                </li>
-              ))}
-            </ul>
+            <div style={{ marginTop: 6 }}>
+              <textarea
+                rows={3}
+                style={{ width: "100%", resize: "vertical" }}
+                value={editNoteText}
+                onChange={(e) => setEditNoteText(e.target.value)}
+                placeholder="Was wurde gemacht…"
+              />
+              <div style={{ marginTop: 6, display: "flex", gap: 8 }}>
+                <button onClick={saveEditNote}>Speichern</button>
+                <button onClick={cancelEditNote}>Abbrechen</button>
+              </div>
+            </div>
           )}
+        </li>
+      );
+    })}
+  </ul>
+)}
+
 
           {/* Urlaub beantragen */}
           <h4 style={{ marginTop: 16 }}>Urlaub beantragen</h4>
@@ -552,7 +624,7 @@ async function saveProjectNote() {
             ))}
           </ul>
 
-          {/* Projekte inkl. Notizen */}
+          {/* Projekte inkl. Notizen (Admin gepflegt) */}
           <h4 style={{ marginTop: 16 }}>Projekte</h4>
           <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
             <input
@@ -581,7 +653,7 @@ async function saveProjectNote() {
 
                 <div style={{ marginTop: 8 }}>
                   <label style={{ display: "block", fontSize: 12, opacity: 0.7, marginBottom: 4 }}>
-                    Projekt-Notiz
+                    Projekt-Notiz (Admin)
                   </label>
                   <textarea
                     rows={3}
@@ -613,13 +685,20 @@ async function saveProjectNote() {
             ))}
           </ul>
 
-          {/* Zeiten */}
+          {/* Zeiten (inkl. Mitarbeiter-Notiz) */}
           <h4 style={{ marginTop: 16 }}>Zeiten</h4>
           {records.length === 0 ? <p>Keine Einträge</p> : (
             <ul>
               {records.map((r) => (
-                <li key={r.id}>
-                  {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause abgezogen)" : ""}
+                <li key={r.id} style={{ marginBottom: 8 }}>
+                  <div>
+                    {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause abgezogen)" : ""}
+                  </div>
+                  {r.workNote && (
+                    <div style={{ fontSize: 13, opacity: 0.9, marginTop: 2 }}>
+                      <strong>Notiz:</strong> {r.workNote}
+                    </div>
+                  )}
                 </li>
               ))}
             </ul>
@@ -631,11 +710,12 @@ async function saveProjectNote() {
             <button
               onClick={() => {
                 if (!records.length) return;
-                const header = ["Mitarbeiter", "Projekt", "Datum", "Start", "Ende", "Minuten", "Lunch(12-13)"];
+                const header = ["Mitarbeiter", "Projekt", "Datum", "Start", "Ende", "Minuten", "Lunch(12-13)", "Notiz"];
                 const rows = records.map((r) => [
                   r.employee, r.project, r.date,
                   fmtTime(r.startISO), fmtTime(r.endISO),
                   String(r.duration ?? ""), r.lunchApplied ? "ja" : "nein",
+                  (r.workNote || "").replace(/\r?\n/g, " "),
                 ]);
                 const csv = [header, ...rows].map((row) => row.join(";")).join("\n");
                 const blob = new Blob([csv], { type: "text/csv" });
@@ -660,6 +740,7 @@ async function saveProjectNote() {
                   Ende: fmtTime(r.endISO),
                   Minuten: r.duration ?? "",
                   "Lunch(12-13)": r.lunchApplied ? "ja" : "nein",
+                  Notiz: r.workNote || "",
                 }));
                 const ws = XLSX.utils.json_to_sheet(data);
                 const wb = XLSX.utils.book_new();
@@ -676,11 +757,12 @@ async function saveProjectNote() {
                 const doc = new jsPDF();
                 if (logoDataUrl) { try { doc.addImage(logoDataUrl, "PNG", 12, 10, 20, 20); } catch {} }
                 doc.setFontSize(16); doc.text("Zeiterfassung Bericht", 40, 22);
-                const head = [["Mitarbeiter", "Projekt", "Datum", "Start", "Ende", "Minuten", "Lunch(12-13)"]];
+                const head = [["Mitarbeiter", "Projekt", "Datum", "Start", "Ende", "Minuten", "Lunch(12-13)", "Notiz"]];
                 const body = records.map((r) => [
                   r.employee, r.project, r.date,
                   fmtTime(r.startISO), fmtTime(r.endISO),
                   String(r.duration ?? ""), r.lunchApplied ? "ja" : "nein",
+                  (r.workNote || "").replace(/\r?\n/g, " "),
                 ]);
                 doc.autoTable({ head, body, startY: 36 }); doc.save("zeiterfassung.pdf");
               }}
