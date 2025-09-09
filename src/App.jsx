@@ -240,21 +240,17 @@ export default function App() {
 
 // ---------- Projekte (Supabase) ----------
   const addProject = async () => {
-    if (!newProject.trim()) return;
-    const payload = {
-      name: newProject.trim(),
-      note: (newProjectNote || "").trim(),
-    };
-    const { data, error } = await supabase
-      .from("projects")
-      .insert(payload)
-      .select()
-      .single();
-    if (error) return alert("Fehler beim Speichern: " + error.message);
-    setProjects((prev) => [...prev, data]);
-    setNewProject("");
-    setNewProjectNote("");
-  };
+  if (!newProject.trim()) return;
+  const { data, error } = await supabase
+    .from("projects")
+    .insert({ name: newProject.trim(), note: "" }) // <- note dazu
+    .select()
+    .single();
+  if (error) return alert("Fehler beim Speichern: " + error.message);
+  setProjects(prev => [...prev, data]);
+  setNewProject("");
+};
+
 
   const saveProjectNote = async (projectId) => {
     const note = (editNotes[projectId] ?? "").trim();
@@ -277,6 +273,31 @@ export default function App() {
     const { error } = await supabase.from("projects").delete().eq("id", id);
     if (error) return alert("Fehler beim Löschen: " + error.message);
     setProjects((prev) => prev.filter((p) => p.id !== id));
+// --- Projekt-Notiz State ---
+const [selectedProjectId, setSelectedProjectId] = useState("");
+const [projectNote, setProjectNote] = useState("");
+
+// Wenn Auswahl wechselt, Text aus aktuellem Projekt übernehmen
+useEffect(() => {
+  if (!selectedProjectId) { setProjectNote(""); return; }
+  const p = projects.find(pr => pr.id === selectedProjectId);
+  setProjectNote(p?.note ?? "");
+}, [selectedProjectId, projects]);
+
+// Notiz speichern
+async function saveProjectNote() {
+  if (!selectedProjectId) return alert("Bitte Projekt wählen");
+  const { data, error } = await supabase
+    .from("projects")
+    .update({ note: projectNote })
+    .eq("id", selectedProjectId)
+    .select()
+    .single();
+  if (error) return alert("Fehler beim Speichern: " + error.message);
+  // lokalen State aktualisieren
+  setProjects(prev => prev.map(p => p.id === data.id ? data : p));
+  alert("Notiz gespeichert ✅");
+}
   };
 
 // ---------- Erfassung (Supabase) ----------
@@ -454,6 +475,31 @@ export default function App() {
               <span>{selectedProjectObj.note || "—"}</span>
             </div>
           )}
+<h4 style={{ marginTop: 16 }}>Projekt-Notiz</h4>
+<div style={{ display: "grid", gap: 8, maxWidth: 600 }}>
+  <select
+    value={selectedProjectId}
+    onChange={(e) => setSelectedProjectId(e.target.value)}
+  >
+    <option value="">Projekt wählen</option>
+    {projects.map(p => (
+      <option key={p.id} value={p.id}>{p.name}</option>
+    ))}
+  </select>
+
+  <textarea
+    rows={4}
+    placeholder="Notiz zum ausgewählten Projekt…"
+    value={projectNote}
+    onChange={(e) => setProjectNote(e.target.value)}
+    disabled={!selectedProjectId}
+    style={{ width: "100%", resize: "vertical" }}
+  />
+
+  <button onClick={saveProjectNote} disabled={!selectedProjectId}>
+    Notiz speichern
+  </button>
+</div>
 
           <h4 style={{ marginTop: 16 }}>Zuletzt erfasste Zeiten</h4>
           {records.length === 0 ? (
