@@ -1,0 +1,12 @@
+// capacitor.config.ts
+import { CapacitorConfig } from '@capacitor/cli';
+
+{
+  "appId": "com.dur.zeiterfassung",
+  "appName": "Zeiterfassung",
+  "webDir": "dist",
+  "bundledWebRuntime": false
+}
+
+
+export default config;
