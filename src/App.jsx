@@ -67,6 +67,11 @@ export default function App() {
   const [vacations, setVacations] = useState([]);
   // Logo (lokal)
   const [logoDataUrl, setLogoDataUrl] = useState(null);
+  
+  // Krankmeldungen
+  const [sicknotes, setSicknotes] = useState([]);
+  const [sickStart, setSickStart] = useState("");
+  const [sickEnd, setSickEnd] = useState("");
 
   // Logins
   const [loginPw, setLoginPw] = useState(""); // Admin
@@ -155,6 +160,18 @@ const displayedRecords = useMemo(() => {
       `)
       .order("created_at", { ascending: false });
 
+// Sicknotes laden
+useEffect(() => {
+  (async () => {
+    const { data, error } = await supabase
+      .from("sicknotes")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (!error && Array.isArray(data)) setSicknotes(data);
+  })();
+}, []);
+
     if (!error && Array.isArray(data)) {
       const mapped = data.map((r) => ({
         id: r.id,
@@ -202,6 +219,7 @@ const displayedRecords = useMemo(() => {
       .on("postgres_changes", { event: "*", schema: "public", table: "records"  }, reloadAll)
       .on("postgres_changes", { event: "*", schema: "public", table: "projects" }, reloadAll)
       .on("postgres_changes", { event: "*", schema: "public", table: "employees"}, reloadAll)
+      .on("postgres_changes", { event: "*", schema: "public", table: "sicknotes"}, reloadAll)
       .subscribe();
 
     const poll = setInterval(reloadAll, 10000);
