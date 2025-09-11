@@ -4,16 +4,16 @@ import { jsPDF } from "jspdf";
 import "jspdf-autotable";
 import { supabase } from "./supabaseClient.js";
 
-// ---------- Konstanten ----------
+// ----------------- Konstanten -----------------
 const LS_KEYS = {
   logo: "zeiterfassung_logo_v3",
   vacations: "zeiterfassung_vacations_v1",
-  legacy_records: "zeiterfassung_records_v3", // alte lokale Zeiten (für Einmal-Migration)
+  legacy_records: "zeiterfassung_records_v3",
 };
+const ADMIN_FALLBACK = "chef123"; // Demo-Admin-PW
+const RUN_KEY = (empId) => `running_record_${empId}`;
 
-const ADMIN_FALLBACK = "chef123"; // simples Admin-Passwort
-
-// ---------- Hilfsfunktionen ----------
+// ----------------- Helfer -----------------
 const newId = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 const fmtTime = (d) =>
   d ? new Date(d).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
@@ -26,20 +26,14 @@ async function sha256Hex(text) {
 }
 
 function safeParse(json, fallback) {
-  try {
-    const v = JSON.parse(json);
-    return v ?? fallback;
-  } catch {
-    return fallback;
-  }
+  try { const v = JSON.parse(json); return v ?? fallback; } catch { return fallback; }
 }
 
-// 12–13 Uhr Pausenabzug (falls Intervall überlappt)
+// 12–13 Uhr Pause automatisch abziehen, wenn Intervall überlappt
 function subtractLunchIfNeeded(startISO, endISO) {
   const start = new Date(startISO);
   const end = new Date(endISO);
   if (isNaN(start) || isNaN(end) || end <= start) return { minutes: 0, lunchApplied: false };
-
   const minutes = Math.round((end - start) / 60000);
   if (start.toDateString() !== end.toDateString()) return { minutes, lunchApplied: false };
 
@@ -47,150 +41,89 @@ function subtractLunchIfNeeded(startISO, endISO) {
   const lunchEnd   = new Date(start); lunchEnd.setHours(13, 0, 0, 0);
   const overlap = Math.max(0, Math.min(end.getTime(), lunchEnd.getTime()) - Math.max(start.getTime(), lunchStart.getTime()));
   const overlapMin = Math.round(overlap / 60000);
-  if (overlapMin > 0) return { minutes: Math.max(0, minutes - overlapMin), lunchApplied: true };
-  return { minutes, lunchApplied: false };
+  return overlapMin > 0
+    ? { minutes: Math.max(0, minutes - overlapMin), lunchApplied: true }
+    : { minutes, lunchApplied: false };
 }
 
-// ---------- Hauptkomponente ----------
+// ----------------- App -----------------
 export default function App() {
-  // Rollen: null (Login), "employee", "admin"
-  const [role, setRole] = useState(null);
+  // Rolle & Benutzer
+  const [role, setRole] = useState(null); // null | 'employee' | 'admin'
+  const [currentEmployee, setCurrentEmployee] = useState(null);
 
-  // Stammdaten (Supabase)
+  // Stammdaten
   const [employees, setEmployees] = useState([]);
   const [projects, setProjects] = useState([]);
 
-  // Records (Supabase)
+  // Zeiten
   const [records, setRecords] = useState([]);
 
-  // Urlaub (lokal)
-  const [vacations, setVacations] = useState([]);
-  // Logo (lokal)
-  const [logoDataUrl, setLogoDataUrl] = useState(null);
-  
-  // Krankmeldungen
-  const [sicknotes, setSicknotes] = useState([]);
-  const [sickStart, setSickStart] = useState("");
-  const [sickEnd, setSickEnd] = useState("");
+  // Laufende Buchung
+  const [runningRecord, setRunningRecord] = useState(null); // {id, startISO, projectId, projectName}
+  const [startTime, setStartTime] = useState(null);         // Date-Objekt für Live-Timer
+  const [, forceTick] = useState(0); // re-render für Live-Uhr
 
-  // Logins
-  const [loginPw, setLoginPw] = useState(""); // Admin
-  const [loginName, setLoginName] = useState(""); // Mitarbeiter
-  const [empPw, setEmpPw] = useState(""); // Mitarbeiter
-  const [currentEmployee, setCurrentEmployee] = useState(null);
-
-  // Auswahl/Erfassung
+  // UI / Form
   const [selectedProject, setSelectedProject] = useState("");
-  const [startTime, setStartTime] = useState(null);
-
-  // Pause-Handling
-  const [isPaused, setIsPaused] = useState(false);
-  const [pausedAt, setPausedAt] = useState(null);
-  const [totalPausedMs, setTotalPausedMs] = useState(0);
-
-  // Live-Anzeige (Laufzeit)
-  const [nowTick, setNowTick] = useState(Date.now());
-  useEffect(() => {
-    if (!startTime) return;
-    const t = setInterval(() => setNowTick(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, [startTime]);
-
-  // Nur eigene Records zeigen, wenn Mitarbeiter eingeloggt
-const displayedRecords = useMemo(() => {
-  if (role === "employee" && currentEmployee) {
-    return records.filter(r => r.employeeId === currentEmployee.id);
-  }
-  return records; // Admin sieht alle
-}, [role, currentEmployee, records]);
-
-  const runningMillis = useMemo(() => {
-    if (!startTime) return 0;
-    const now = Date.now();
-    const base = now - new Date(startTime).getTime();
-    const pausedExtra = isPaused && pausedAt ? now - new Date(pausedAt).getTime() : 0;
-    return Math.max(0, base - totalPausedMs - pausedExtra);
-  }, [startTime, isPaused, pausedAt, totalPausedMs, nowTick]);
-
-  const runningHMS = useMemo(() => {
-    let s = Math.floor(runningMillis / 1000);
-    const h = Math.floor(s / 3600); s -= h * 3600;
-    const m = Math.floor(s / 60); s -= m * 60;
-    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-  }, [runningMillis]);
-
-  // Admin-Form „Neuer Mitarbeiter/Projekt“
+  const [loginPw, setLoginPw] = useState("");
+  const [loginName, setLoginName] = useState("");
+  const [empPw, setEmpPw] = useState("");
   const [newEmpName, setNewEmpName] = useState("");
   const [newEmpPw, setNewEmpPw] = useState("");
   const [newProject, setNewProject] = useState("");
   const [newProjectNote, setNewProjectNote] = useState("");
-
-  // Inline-Editing der Projekt-Notizen
   const [editNotes, setEditNotes] = useState({}); // { [projectId]: "text" }
 
-  // Urlaubseingabe
+  // Urlaub (lokal wie gehabt)
+  const [vacations, setVacations] = useState([]);
   const [vacStart, setVacStart] = useState("");
   const [vacEnd, setVacEnd] = useState("");
 
-// ---------- Supabase laden ----------
-  // Employees
+  // Logo (lokal)
+  const [logoDataUrl, setLogoDataUrl] = useState(null);
+
+  // ---------- Initiales Laden ----------
   useEffect(() => {
     (async () => {
-      const { data, error } = await supabase.from("employees").select("*").order("name");
-      if (!error && Array.isArray(data)) setEmployees(data);
+      const [eRes, pRes] = await Promise.all([
+        supabase.from("employees").select("*").order("name"),
+        supabase.from("projects").select("*").order("name"),
+      ]);
+      if (!eRes.error) setEmployees(eRes.data ?? []);
+      if (!pRes.error) setProjects(pRes.data ?? []);
     })();
   }, []);
 
-  // Projects (inkl. note)
-  useEffect(() => {
-    (async () => {
-      const { data, error } = await supabase.from("projects").select("*").order("name");
-      if (!error && Array.isArray(data)) setProjects(data);
-    })();
-  }, []);
-
-  // Records
-  const loadRecords = async () => {
+  async function loadRecords() {
     const { data, error } = await supabase
       .from("records")
       .select(`
-        id, employee_id, project_id, start_iso, end_iso, duration_minutes, lunch_applied, created_at,
+        id, employee_id, project_id, start_iso, end_iso, duration_minutes, lunch_applied, status, created_at,
         employees:employee_id ( name ),
         projects:project_id  ( name, note )
       `)
       .order("created_at", { ascending: false });
 
-// Sicknotes laden
-useEffect(() => {
-  (async () => {
-    const { data, error } = await supabase
-      .from("sicknotes")
-      .select("*")
-      .order("created_at", { ascending: false });
-
-    if (!error && Array.isArray(data)) setSicknotes(data);
-  })();
-}, []);
-
-    if (!error && Array.isArray(data)) {
-      const mapped = data.map((r) => ({
-        id: r.id,
-        employeeId: r.employee_id,
-        projectId: r.project_id,
-        employee: r.employees?.name ?? "",
-        project: r.projects?.name ?? "",
-        date: new Date(r.start_iso).toLocaleDateString(),
-        startISO: r.start_iso,
-        endISO: r.end_iso,
-        duration: r.duration_minutes,
-        lunchApplied: r.lunch_applied,
-      }));
-      setRecords(mapped);
-    }
-  };
+    if (error) return;
+    const mapped = (data ?? []).map((r) => ({
+      id: r.id,
+      employeeId: r.employee_id,
+      projectId: r.project_id,
+      employee: r.employees?.name ?? "",
+      project: r.projects?.name ?? "",
+      date: new Date(r.start_iso).toLocaleDateString(),
+      startISO: r.start_iso,
+      endISO: r.end_iso,
+      duration: r.duration_minutes,
+      lunchApplied: r.lunch_applied,
+      status: r.status,
+    }));
+    setRecords(mapped);
+  }
   useEffect(() => { loadRecords(); }, []);
 
-  // Lokal: Urlaub + Logo
+  // Urlaub & Logo lokal laden/speichern
   useEffect(() => {
     const v = safeParse(localStorage.getItem(LS_KEYS.vacations), []);
     const l = localStorage.getItem(LS_KEYS.logo) || null;
@@ -200,26 +133,25 @@ useEffect(() => {
   useEffect(() => { localStorage.setItem(LS_KEYS.vacations, JSON.stringify(vacations)); }, [vacations]);
   useEffect(() => { if (logoDataUrl) localStorage.setItem(LS_KEYS.logo, logoDataUrl); }, [logoDataUrl]);
 
-  // Realtime + Polling
+  // Realtime & Polling
   useEffect(() => {
     const reloadAll = async () => {
       try {
-        const [empRes, projRes] = await Promise.all([
+        const [eRes, pRes] = await Promise.all([
           supabase.from("employees").select("*").order("name"),
           supabase.from("projects").select("*").order("name"),
         ]);
-        if (!empRes.error) setEmployees(empRes.data ?? []);
-        if (!projRes.error) setProjects(projRes.data ?? []);
+        if (!eRes.error) setEmployees(eRes.data ?? []);
+        if (!pRes.error) setProjects(pRes.data ?? []);
         await loadRecords();
       } catch {}
     };
 
     const channel = supabase
       .channel("realtime-all")
-      .on("postgres_changes", { event: "*", schema: "public", table: "records"  }, reloadAll)
-      .on("postgres_changes", { event: "*", schema: "public", table: "projects" }, reloadAll)
-      .on("postgres_changes", { event: "*", schema: "public", table: "employees"}, reloadAll)
-      .on("postgres_changes", { event: "*", schema: "public", table: "sicknotes"}, reloadAll)
+      .on("postgres_changes", { event: "*", schema: "public", table: "employees" }, reloadAll)
+      .on("postgres_changes", { event: "*", schema: "public", table: "projects"  }, reloadAll)
+      .on("postgres_changes", { event: "*", schema: "public", table: "records"   }, reloadAll)
       .subscribe();
 
     const poll = setInterval(reloadAll, 10000);
@@ -229,7 +161,27 @@ useEffect(() => {
     };
   }, []);
 
-// ---------- Logins ----------
+  // Live-Uhr (jede Sekunde)
+  useEffect(() => {
+    if (!startTime) return;
+    const t = setInterval(() => forceTick((x) => x + 1), 1000);
+    return () => clearInterval(t);
+  }, [startTime]);
+
+  // Nach Login: evtl. laufenden Record aus LocalStorage in UI setzen
+  useEffect(() => {
+    if (!currentEmployee) return;
+    const raw = localStorage.getItem(RUN_KEY(currentEmployee.id));
+    if (!raw) return;
+    try {
+      const rr = JSON.parse(raw);
+      setRunningRecord(rr);
+      setStartTime(new Date(rr.startISO));
+      setSelectedProject(rr.projectName || "");
+    } catch {}
+  }, [currentEmployee]);
+
+  // ---------- Login ----------
   const handleLogin = () => {
     if (loginPw !== ADMIN_FALLBACK) return alert("Falsches Admin-Passwort");
     setRole("admin");
@@ -240,14 +192,66 @@ useEffect(() => {
   const handleEmployeeLogin = async () => {
     const emp = employees.find((e) => e.name === loginName && e.active !== false);
     if (!emp) return alert("Mitarbeiter nicht gefunden oder deaktiviert");
+
     const hash = await sha256Hex(empPw);
-    if (emp.password_hash === hash) {
-      setRole("employee");
-      setCurrentEmployee(emp);
-      setLoginName("");
-      setEmpPw("");
+    if (emp.password_hash !== hash) return alert("Falsches Passwort");
+
+    setRole("employee");
+    setCurrentEmployee(emp);
+    setLoginName("");
+    setEmpPw("");
+
+    // offenen Record nach Login laden
+    const { data: openRec, error: openErr } = await supabase
+      .from("records")
+      .select(`
+        id, employee_id, project_id, start_iso, status,
+        projects:project_id ( name )
+      `)
+      .eq("employee_id", emp.id)
+      .eq("status", "running")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!openErr && openRec) {
+      // ggf. Auto-Stop bis 17:00
+      const start = new Date(openRec.start_iso);
+      const seventeen = new Date(start);
+      seventeen.setHours(17, 0, 0, 0);
+
+      if (Date.now() > seventeen.getTime() && start.toDateString() === new Date().toDateString()) {
+        const { minutes, lunchApplied } = subtractLunchIfNeeded(start.toISOString(), seventeen.toISOString());
+        await supabase
+          .from("records")
+          .update({
+            end_iso: seventeen.toISOString(),
+            duration_minutes: minutes,
+            lunch_applied: lunchApplied,
+            status: "auto-stopped",
+          })
+          .eq("id", openRec.id);
+
+        localStorage.removeItem(RUN_KEY(emp.id));
+        setRunningRecord(null);
+        setStartTime(null);
+        await loadRecords();
+        alert("Laufende Zeit wurde automatisch um 17:00 gestoppt.");
+      } else {
+        const rr = {
+          id: openRec.id,
+          startISO: openRec.start_iso,
+          projectId: openRec.project_id,
+          projectName: openRec.projects?.name ?? "",
+        };
+        setRunningRecord(rr);
+        setStartTime(new Date(openRec.start_iso));
+        setSelectedProject(rr.projectName || "");
+        localStorage.setItem(RUN_KEY(emp.id), JSON.stringify(rr));
+      }
     } else {
-      alert("Falsches Passwort");
+      setRunningRecord(null);
+      localStorage.removeItem(RUN_KEY(emp.id));
     }
   };
 
@@ -256,12 +260,10 @@ useEffect(() => {
     setCurrentEmployee(null);
     setSelectedProject("");
     setStartTime(null);
-    setIsPaused(false);
-    setPausedAt(null);
-    setTotalPausedMs(0);
+    setRunningRecord(null);
   };
 
-// ---------- Mitarbeiter (Supabase) ----------
+  // ---------- Mitarbeiter-CRUD ----------
   const addEmployee = async () => {
     if (!newEmpName.trim() || !newEmpPw.trim()) return alert("Bitte Name & Passwort eingeben");
     const password_hash = await sha256Hex(newEmpPw);
@@ -289,7 +291,7 @@ useEffect(() => {
     setEmployees((prev) => prev.map((e) => (e.id === id ? data : e)));
   };
 
-// ---------- Projekte (Supabase) ----------
+  // ---------- Projekte (mit Notizen) ----------
   const addProject = async () => {
     if (!newProject.trim()) return;
     const { data, error } = await supabase
@@ -314,9 +316,7 @@ useEffect(() => {
     if (error) return alert("Fehler beim Speichern der Notiz: " + error.message);
     setProjects((prev) => prev.map((p) => (p.id === projectId ? data : p)));
     setEditNotes((prev) => {
-      const next = { ...prev };
-      delete next[projectId];
-      return next;
+      const next = { ...prev }; delete next[projectId]; return next;
     });
   };
 
@@ -326,69 +326,62 @@ useEffect(() => {
     setProjects((prev) => prev.filter((p) => p.id !== id));
   };
 
-// ---------- Erfassung (Supabase) ----------
-  const handleStart = () => {
+  // ---------- Start/Stop ----------
+  const handleStart = async () => {
     if (!currentEmployee) return alert("Bitte als Mitarbeiter einloggen");
     if (!selectedProject) return alert("Bitte Projekt wählen");
-    setStartTime(new Date());
-    setIsPaused(false);
-    setPausedAt(null);
-    setTotalPausedMs(0);
-  };
+    if (runningRecord) return alert("Es läuft bereits eine Buchung.");
 
-  const togglePause = () => {
-    if (!startTime) return;
-    if (!isPaused) {
-      setIsPaused(true);
-      setPausedAt(new Date());
-    } else {
-      // Pause beenden → aufsummieren
-      if (pausedAt) {
-        const extra = Date.now() - new Date(pausedAt).getTime();
-        setTotalPausedMs((ms) => ms + Math.max(0, extra));
-      }
-      setPausedAt(null);
-      setIsPaused(false);
-    }
-  };
-
-  const handleStop = async () => {
-    if (!startTime || !currentEmployee) return;
-
-    // offenes Pausenintervall beenden
-    let pausedMs = totalPausedMs;
-    if (isPaused && pausedAt) {
-      pausedMs += Math.max(0, Date.now() - new Date(pausedAt).getTime());
-    }
-
-    const end = new Date();
-    const startISO = new Date(startTime).toISOString();
-    const endISO = end.toISOString();
-
-    // reine Arbeitszeit (ohne Pausen) in Minuten
-    const grossMinutes = Math.round((new Date(endISO) - new Date(startISO)) / 60000);
-    const pauseMinutes = Math.round(pausedMs / 60000);
-    const netBeforeLunch = Math.max(0, grossMinutes - pauseMinutes);
-
-    // zusätzlich automatische Mittagspause, falls überlappt
-    const { minutes: finalMinutes, lunchApplied } = subtractLunchIfNeeded(startISO, endISO);
-    // finalMinutes bezieht sich auf "brutto", daher unsere Pausen noch abziehen:
-    const durationMinutes = Math.max(0, finalMinutes - pauseMinutes);
-
-    // IDs zu Name finden
     const proj = projects.find((p) => p.name === selectedProject);
     if (!proj) return alert("Projekt nicht gefunden");
 
+    const nowISO = new Date().toISOString();
     const { data, error } = await supabase
       .from("records")
       .insert({
         employee_id: currentEmployee.id,
         project_id: proj.id,
-        start_iso: startISO,
-        end_iso: endISO,
-        duration_minutes: durationMinutes,
-        lunch_applied: lunchApplied,
+        start_iso: nowISO,
+        end_iso: null,
+        duration_minutes: null,
+        lunch_applied: false,
+        status: "running",
       })
+      .select(`
+        id, employee_id, project_id, start_iso,
+        projects:project_id ( name )
+      `)
+      .single();
+
+    if (error) return alert("Fehler beim Start: " + error.message);
+
+    setStartTime(new Date(nowISO));
+    const rr = {
+      id: data.id,
+      startISO: data.start_iso,
+      projectId: data.project_id,
+      projectName: data.projects?.name ?? selectedProject,
+    };
+    setRunningRecord(rr);
+    localStorage.setItem(RUN_KEY(currentEmployee.id), JSON.stringify(rr));
+  };
+
+  const handleStop = async () => {
+    if (!currentEmployee) return;
+    if (!runningRecord || !startTime) return;
+
+    const end = new Date();
+    const { minutes, lunchApplied } = subtractLunchIfNeeded(startTime.toISOString(), end.toISOString());
+
+    const { data, error } = await supabase
+      .from("records")
+      .update({
+        end_iso: end.toISOString(),
+        duration_minutes: minutes,
+        lunch_applied: lunchApplied,
+        status: "stopped",
+      })
+      .eq("id", runningRecord.id)
       .select(`
         id, employee_id, project_id, start_iso, end_iso, duration_minutes, lunch_applied, created_at,
         employees:employee_id ( name ),
@@ -396,17 +389,14 @@ useEffect(() => {
       `)
       .single();
 
-    if (error) {
-      alert("Fehler beim Speichern: " + error.message);
-      return;
-    }
+    if (error) return alert("Fehler beim Stop: " + error.message);
 
     const mapped = {
       id: data.id,
       employeeId: data.employee_id,
       projectId: data.project_id,
-      employee: data.employees?.name ?? "",
-      project: data.projects?.name ?? "",
+      employee: data.employees?.name ?? currentEmployee.name,
+      project: data.projects?.name ?? runningRecord.projectName,
       date: new Date(data.start_iso).toLocaleDateString(),
       startISO: data.start_iso,
       endISO: data.end_iso,
@@ -414,36 +404,24 @@ useEffect(() => {
       lunchApplied: data.lunch_applied,
     };
     setRecords((prev) => [mapped, ...prev]);
-
-    // Reset
     setStartTime(null);
-    setIsPaused(false);
-    setPausedAt(null);
-    setTotalPausedMs(0);
+    setRunningRecord(null);
+    localStorage.removeItem(RUN_KEY(currentEmployee.id));
   };
 
-// ---------- Urlaub (lokal) ----------
+  // ---------- Urlaub lokal ----------
   const handleVacationRequest = () => {
     if (!currentEmployee) return alert("Bitte einloggen");
     if (!vacStart || !vacEnd) return alert("Bitte Start- und Enddatum wählen");
     if (new Date(vacEnd) < new Date(vacStart)) return alert("Enddatum muss >= Startdatum sein");
-    const newVac = {
-      id: newId(),
-      employeeId: currentEmployee.id,
-      startDate: vacStart,
-      endDate: vacEnd,
-      status: "offen",
-    };
+    const newVac = { id: newId(), employeeId: currentEmployee.id, startDate: vacStart, endDate: vacEnd, status: "offen" };
     setVacations((prev) => [...prev, newVac]);
-    setVacStart("");
-    setVacEnd("");
+    setVacStart(""); setVacEnd("");
   };
-  const approveVacation = (id) =>
-    setVacations((prev) => prev.map((v) => (v.id === id ? { ...v, status: "genehmigt" } : v)));
-  const rejectVacation = (id) =>
-    setVacations((prev) => prev.map((v) => (v.id === id ? { ...v, status: "abgelehnt" } : v)));
+  const approveVacation = (id) => setVacations((prev) => prev.map((v) => (v.id === id ? { ...v, status: "genehmigt" } : v)));
+  const rejectVacation  = (id) => setVacations((prev) => prev.map((v) => (v.id === id ? { ...v, status: "abgelehnt" } : v)));
 
-// ---------- Export / Logo ----------
+  // ---------- Export/Logo ----------
   const onLogoFile = (file) => {
     if (!file) return;
     const reader = new FileReader();
@@ -451,13 +429,10 @@ useEffect(() => {
     reader.readAsDataURL(file);
   };
 
-  // (optional) Einmal-Migration lokaler Zeiten → Supabase
+  // ---------- Migration lokal -> Supabase (optional) ----------
   const migrateLocalRecordsToSupabase = async () => {
     const local = safeParse(localStorage.getItem(LS_KEYS.legacy_records), []);
-    if (!Array.isArray(local) || local.length === 0) {
-      alert("Keine lokalen Zeiten gefunden.");
-      return;
-    }
+    if (!Array.isArray(local) || local.length === 0) { alert("Keine lokalen Zeiten gefunden."); return; }
     if (!confirm(`Es werden ${local.length} lokale Einträge versucht zu migrieren. Fortfahren?`)) return;
 
     const empByName = new Map(employees.map((e) => [e.name, e.id]));
@@ -476,33 +451,33 @@ useEffect(() => {
           end_iso: r.endISO,
           duration_minutes: minutes,
           lunch_applied: lunchApplied,
+          status: "stopped",
         });
         if (error) { fail++; continue; }
         ok++;
-      } catch {
-        fail++;
-      }
+      } catch { fail++; }
     }
     await loadRecords();
     alert(`Migration abgeschlossen: ${ok} importiert, ${fail} übersprungen.`);
   };
 
-// ---------- Anzeige-Hilfen ----------
-  const myVacations = useMemo(
-    () => (currentEmployee ? vacations.filter((v) => v.employeeId === currentEmployee.id) : []),
-    [vacations, currentEmployee]
-  );
-
+  // ---------- Anzeige / Ableitungen ----------
   const selectedProjectObj = useMemo(
     () => projects.find((x) => x.name === selectedProject) || null,
     [projects, selectedProject]
   );
 
+  const myRecords = useMemo(() => {
+    if (!currentEmployee) return [];
+    return records.filter((r) => r.employee === currentEmployee.name);
+  }, [records, currentEmployee]);
+
+  // ----------------- UI -----------------
   return (
     <div style={{ padding: 16, maxWidth: 980, margin: "0 auto" }}>
       <h2>Digitale Zeiterfassung</h2>
 
-      {/* ---------- Login ---------- */}
+      {/* Login */}
       {!role && (
         <section>
           <h3>Login</h3>
@@ -521,7 +496,7 @@ useEffect(() => {
         </section>
       )}
 
-      {/* ---------- Mitarbeiter-Ansicht ---------- */}
+      {/* Mitarbeiter-Ansicht */}
       {role === "employee" && currentEmployee && (
         <section style={{ marginTop: 16 }}>
           <h3>Zeiterfassung für {currentEmployee.name}</h3>
@@ -530,16 +505,14 @@ useEffect(() => {
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
             <select value={selectedProject} onChange={(e) => setSelectedProject(e.target.value)}>
               <option value="">Projekt wählen</option>
-              {projects.map((p) => (
-                <option key={p.id} value={p.name}>{p.name}</option>
-              ))}
+              {projects.map((p) => <option key={p.id} value={p.name}>{p.name}</option>)}
             </select>
-            <button onClick={handleStart} disabled={!selectedProject || !!startTime}>Start</button>
-            <button onClick={togglePause} disabled={!startTime}>{isPaused ? "Weiter" : "Pause"}</button>
-            <button onClick={handleStop} disabled={!startTime}>Stop</button>
+            <button onClick={handleStart} disabled={!selectedProject || !!runningRecord}>Start</button>
+            <button onClick={handleStop} disabled={!runningRecord}>Stop</button>
             {startTime && (
-              <span style={{ marginLeft: 8 }}>
-                Laufzeit: <strong>{runningHMS}</strong>{isPaused ? " (pausiert)" : ""}
+              <span>
+                Gestartet: {fmtTime(startTime.toISOString())} •
+                Gelaufen: {Math.floor((Date.now() - startTime.getTime()) / 60000)} min
               </span>
             )}
           </div>
@@ -552,20 +525,21 @@ useEffect(() => {
             </div>
           )}
 
-          <h4 style={{ marginTop: 16 }}>Zuletzt erfasste Zeiten</h4>
-          {displayedRecords.length === 0 ? (
+          <h4 style={{ marginTop: 16 }}>Meine letzten Zeiten</h4>
+          {myRecords.length === 0 ? (
             <p>Noch keine Einträge</p>
           ) : (
             <ul>
-              {displayedRecords.map((r) => (
+              {myRecords.map((r) => (
                 <li key={r.id}>
-                  {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause 12–13 abgezogen)" : ""}
+                  {r.date} | {r.project} | {fmtTime(r.startISO)}–{r.endISO ? fmtTime(r.endISO) : "läuft …"} |{" "}
+                  {r.duration ?? "—"} Min {r.lunchApplied ? "(Pause abgezogen)" : ""} {r.status ? `• ${r.status}` : ""}
                 </li>
               ))}
             </ul>
           )}
 
-          {/* Urlaub beantragen */}
+          {/* Urlaub */}
           <h4 style={{ marginTop: 16 }}>Urlaub beantragen</h4>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
             <input type="date" value={vacStart} onChange={(e) => setVacStart(e.target.value)} />
@@ -573,15 +547,14 @@ useEffect(() => {
             <button onClick={handleVacationRequest}>Beantragen</button>
           </div>
           <ul>
-            {myVacations.length === 0 && <li>Keine Anträge</li>}
-            {myVacations.map((v) => (
+            {vacations.filter(v => v.employeeId === currentEmployee.id).map((v) => (
               <li key={v.id}>{v.startDate} – {v.endDate} → {v.status}</li>
             ))}
           </ul>
         </section>
       )}
 
-      {/* ---------- Admin-Ansicht ---------- */}
+      {/* Admin-Ansicht */}
       {role === "admin" && (
         <section style={{ marginTop: 16 }}>
           <h3>Admin-Ansicht</h3>
@@ -603,20 +576,11 @@ useEffect(() => {
             ))}
           </ul>
 
-          {/* Projekte inkl. Notizen */}
+          {/* Projekte + Notizen */}
           <h4 style={{ marginTop: 16 }}>Projekte</h4>
           <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
-            <input
-              placeholder="Neues Projekt"
-              value={newProject}
-              onChange={(e) => setNewProject(e.target.value)}
-            />
-            <input
-              placeholder="Notiz (optional)"
-              value={newProjectNote}
-              onChange={(e) => setNewProjectNote(e.target.value)}
-              style={{ minWidth: 260 }}
-            />
+            <input placeholder="Neues Projekt" value={newProject} onChange={(e) => setNewProject(e.target.value)} />
+            <input placeholder="Notiz (optional)" value={newProjectNote} onChange={(e) => setNewProjectNote(e.target.value)} style={{ minWidth: 260 }} />
             <button onClick={addProject}>Hinzufügen</button>
           </div>
 
@@ -629,32 +593,19 @@ useEffect(() => {
                     <button onClick={() => removeProject(p.id)}>Löschen</button>
                   </div>
                 </div>
-
                 <div style={{ marginTop: 8 }}>
-                  <label style={{ display: "block", fontSize: 12, opacity: 0.7, marginBottom: 4 }}>
-                    Projekt-Notiz
-                  </label>
+                  <label style={{ display: "block", fontSize: 12, opacity: 0.7, marginBottom: 4 }}>Projekt-Notiz</label>
                   <textarea
                     rows={3}
                     style={{ width: "100%", resize: "vertical" }}
                     placeholder="Infos, Besonderheiten, Adresse, Ansprechpartner…"
                     value={editNotes[p.id] ?? p.note ?? ""}
-                    onChange={(e) =>
-                      setEditNotes((prev) => ({ ...prev, [p.id]: e.target.value }))
-                    }
+                    onChange={(e) => setEditNotes((prev) => ({ ...prev, [p.id]: e.target.value }))}
                   />
                   <div style={{ marginTop: 6, display: "flex", gap: 8 }}>
                     <button onClick={() => saveProjectNote(p.id)}>Notiz speichern</button>
                     {editNotes[p.id] !== undefined && (
-                      <button
-                        onClick={() =>
-                          setEditNotes((prev) => {
-                            const next = { ...prev };
-                            delete next[p.id];
-                            return next;
-                          })
-                        }
-                      >
+                      <button onClick={() => setEditNotes((prev) => { const n = { ...prev }; delete n[p.id]; return n; })}>
                         Änderungen verwerfen
                       </button>
                     )}
@@ -664,13 +615,14 @@ useEffect(() => {
             ))}
           </ul>
 
-          {/* Zeiten */}
+          {/* Zeiten (alle) */}
           <h4 style={{ marginTop: 16 }}>Zeiten</h4>
           {records.length === 0 ? <p>Keine Einträge</p> : (
             <ul>
               {records.map((r) => (
                 <li key={r.id}>
-                  {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause 12–13 abgezogen)" : ""}
+                  {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{r.endISO ? fmtTime(r.endISO) : "läuft …"} |{" "}
+                  {r.duration ?? "—"} Min {r.lunchApplied ? "(Pause abgezogen)" : ""} {r.status ? `• ${r.status}` : ""}
                 </li>
               ))}
             </ul>
@@ -682,17 +634,17 @@ useEffect(() => {
             <button
               onClick={() => {
                 if (!records.length) return;
-                const header = ["Mitarbeiter", "Projekt", "Datum", "Start", "Ende", "Minuten", "Lunch(12-13)"];
+                const header = ["Mitarbeiter", "Projekt", "Datum", "Start", "Ende", "Minuten", "Lunch(12-13)", "Status"];
                 const rows = records.map((r) => [
-                  r.employee, r.project, r.date,
-                  fmtTime(r.startISO), fmtTime(r.endISO),
+                  r.employee, r.project, r.date, fmtTime(r.startISO),
+                  r.endISO ? fmtTime(r.endISO) : "läuft …",
                   String(r.duration ?? ""), r.lunchApplied ? "ja" : "nein",
+                  r.status || "",
                 ]);
                 const csv = [header, ...rows].map((row) => row.join(";")).join("\n");
                 const blob = new Blob([csv], { type: "text/csv" });
                 const url = URL.createObjectURL(blob);
-                const a = document.createElement("a");
-                a.href = url; a.download = "zeiterfassung.csv"; a.click();
+                const a = document.createElement("a"); a.href = url; a.download = "zeiterfassung.csv"; a.click();
                 URL.revokeObjectURL(url);
               }}
               disabled={!records.length}
@@ -708,9 +660,10 @@ useEffect(() => {
                   Projekt: r.project,
                   Datum: r.date,
                   Start: fmtTime(r.startISO),
-                  Ende: fmtTime(r.endISO),
+                  Ende: r.endISO ? fmtTime(r.endISO) : "läuft …",
                   Minuten: r.duration ?? "",
                   "Lunch(12-13)": r.lunchApplied ? "ja" : "nein",
+                  Status: r.status || "",
                 }));
                 const ws = XLSX.utils.json_to_sheet(data);
                 const wb = XLSX.utils.book_new();
@@ -727,11 +680,12 @@ useEffect(() => {
                 const doc = new jsPDF();
                 if (logoDataUrl) { try { doc.addImage(logoDataUrl, "PNG", 12, 10, 20, 20); } catch {} }
                 doc.setFontSize(16); doc.text("Zeiterfassung Bericht", 40, 22);
-                const head = [["Mitarbeiter", "Projekt", "Datum", "Start", "Ende", "Minuten", "Lunch(12-13)"]];
+                const head = [["Mitarbeiter", "Projekt", "Datum", "Start", "Ende", "Minuten", "Lunch(12-13)", "Status"]];
                 const body = records.map((r) => [
-                  r.employee, r.project, r.date,
-                  fmtTime(r.startISO), fmtTime(r.endISO),
+                  r.employee, r.project, r.date, fmtTime(r.startISO),
+                  r.endISO ? fmtTime(r.endISO) : "läuft …",
                   String(r.duration ?? ""), r.lunchApplied ? "ja" : "nein",
+                  r.status || "",
                 ]);
                 doc.autoTable({ head, body, startY: 36 }); doc.save("zeiterfassung.pdf");
               }}
@@ -746,7 +700,7 @@ useEffect(() => {
             <input type="file" accept="image/*" onChange={(e) => onLogoFile(e.target.files?.[0])} />
           </div>
 
-          {/* Daten-Werkzeuge */}
+          {/* Tools */}
           <h4 style={{ marginTop: 16 }}>Daten-Werkzeuge</h4>
           <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
             <button onClick={migrateLocalRecordsToSupabase}>Lokale Zeiten → Supabase (einmalig)</button>
