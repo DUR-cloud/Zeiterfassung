@@ -528,17 +528,21 @@ export default function App() {
           )}
 
           <h4 style={{ marginTop: 16 }}>Zuletzt erfasste Zeiten</h4>
-          {records.length === 0 ? (
-            <p>Noch keine Einträge</p>
-          ) : (
-            <ul>
-              {records.map((r) => (
-                <li key={r.id}>
-                  {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause 12–13 abgezogen)" : ""}
-                </li>
-              ))}
-            </ul>
-          )}
+          {(() => {
+  const myRecords = records.filter(r => r.employeeId === currentEmployee.id);
+  return myRecords.length === 0 ? (
+    <p>Noch keine Einträge</p>
+  ) : (
+    <ul>
+      {myRecords.map((r) => (
+        <li key={r.id}>
+          {r.date} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause 12–13 abgezogen)" : ""}
+        </li>
+      ))}
+    </ul>
+  );
+})()}
+
 
           {/* Urlaub beantragen */}
           <h4 style={{ marginTop: 16 }}>Urlaub beantragen</h4>
