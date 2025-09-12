@@ -179,40 +179,54 @@ const runningHMS = useMemo(() => {
   useEffect(() => { localStorage.setItem(LS_KEYS.vacations, JSON.stringify(vacations)); }, [vacations]);
   useEffect(() => { if (logoDataUrl) localStorage.setItem(LS_KEYS.logo, logoDataUrl); }, [logoDataUrl]);
 
-  // Realtime + Polling
- // Auto-Stop bis 17:00 Uhr, auch wenn Tab wieder offen ist
+  // Realtime + Polling (ein Effekt)
+useEffect(() => {
+  const reloadAll = async () => {
+    try {
+      const [empRes, projRes] = await Promise.all([
+        supabase.from("employees").select("*").order("name"),
+        supabase.from("projects").select("*").order("name"),
+      ]);
+      if (!empRes.error) setEmployees(empRes.data ?? []);
+      if (!projRes.error) setProjects(projRes.data ?? []);
+      await loadRecords();
+    } catch {}
+  };
+
+  // sofort einmal laden
+  reloadAll();
+
+  // Realtime abonnieren
+  const channel = supabase
+    .channel("realtime-all")
+    .on("postgres_changes", { event: "*", schema: "public", table: "records"  }, reloadAll)
+    .on("postgres_changes", { event: "*", schema: "public", table: "projects" }, reloadAll)
+    .on("postgres_changes", { event: "*", schema: "public", table: "employees"}, reloadAll)
+    .subscribe();
+
+  // Fallback-Polling
+  const poll = setInterval(reloadAll, 10000);
+
+  return () => {
+    supabase.removeChannel(channel);
+    clearInterval(poll);
+  };
+}, []);
+
+// 17:00-Autostopp (eigener Effekt)
 useEffect(() => {
   if (!startISO || !runningRecordId) return;
-
   const iv = setInterval(() => {
-    const now = new Date();
-    const limit = new Date(startISO);
-    // 17:00 am Tag des Starts
-    limit.setHours(17, 0, 0, 0);
-    if (now >= limit) {
-      // stoppt den laufenden Datensatz
-      // handleStop ist async, aber hier reicht der Aufruf
-      handleStop();
+    const start = new Date(startISO);
+    const limit = new Date(start);
+    limit.setHours(17, 0, 0, 0); // 17:00 am Start-Tag
+    if (Date.now() >= +limit) {
+      handleStop(); // beendet den laufenden Datensatz
     }
   }, 30_000); // alle 30s prüfen
-
   return () => clearInterval(iv);
-}, [startISO, runningRecordId, pausedAtISO, pausedMs]);
+}, [startISO, runningRecordId]);
 
-
-    const channel = supabase
-      .channel("realtime-all")
-      .on("postgres_changes", { event: "*", schema: "public", table: "records"  }, reloadAll)
-      .on("postgres_changes", { event: "*", schema: "public", table: "projects" }, reloadAll)
-      .on("postgres_changes", { event: "*", schema: "public", table: "employees"}, reloadAll)
-      .subscribe();
-
-    const poll = setInterval(reloadAll, 10000);
-    return () => {
-      supabase.removeChannel(channel);
-      clearInterval(poll);
-    };
-  }, []);
 
 // ---------- Logins ----------
   const handleLogin = () => {
