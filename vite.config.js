@@ -12,7 +12,7 @@ export default defineConfig({
         cleanupOutdatedCaches: true,        // alte Caches weg
         clientsClaim: true,                 // SW übernimmt sofort
         skipWaiting: true                   // neue Version sofort aktiv
-      },
+      },)
       devOptions: {
         enabled: true                       // SW auch im dev (optional)
       },
