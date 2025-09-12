@@ -75,12 +75,10 @@ export default function App() {
 
   // Auswahl/Erfassung
   const [selectedProject, setSelectedProject] = useState("");
-  const [startTime, setStartTime] = useState(null);
+  
 
   // Pause-Handling
-  const [isPaused, setIsPaused] = useState(false);
-  const [pausedAt, setPausedAt] = useState(null);
-  const [totalPausedMs, setTotalPausedMs] = useState(0);
+ 
 
   // ID des laufenden Datensatzes (für UPDATE beim Stop)
   const [runningRecordId, setRunningRecordId] = useState(localStorage.getItem("runningRecordId") || null);
@@ -182,30 +180,25 @@ const runningHMS = useMemo(() => {
   useEffect(() => { if (logoDataUrl) localStorage.setItem(LS_KEYS.logo, logoDataUrl); }, [logoDataUrl]);
 
   // Realtime + Polling
-  useEffect(() => {
-    const reloadAll = async () => {
-      try {
-        const [empRes, projRes] = await Promise.all([
-          supabase.from("employees").select("*").order("name"),
-          supabase.from("projects").select("*").order("name"),
-        ]);
-        if (!empRes.error) setEmployees(empRes.data ?? []);
-        if (!projRes.error) setProjects(projRes.data ?? []);
-        await loadRecords();
-      } catch {}
-    };
-  useEffect(() => {
+ // Auto-Stop bis 17:00 Uhr, auch wenn Tab wieder offen ist
+useEffect(() => {
+  if (!startISO || !runningRecordId) return;
+
   const iv = setInterval(() => {
-    if (!startISO || !runningRecordId) return;
     const now = new Date();
     const limit = new Date(startISO);
-    limit.setHours(17, 0, 0, 0); // heute 17:00 (auf Start-Tag bezogen)
+    // 17:00 am Tag des Starts
+    limit.setHours(17, 0, 0, 0);
     if (now >= limit) {
-      handleStop(); // feuert Update
+      // stoppt den laufenden Datensatz
+      // handleStop ist async, aber hier reicht der Aufruf
+      handleStop();
     }
   }, 30_000); // alle 30s prüfen
+
   return () => clearInterval(iv);
-}, [startISO, runningRecordId]); // handleStop ist stabil genug hier
+}, [startISO, runningRecordId, pausedAtISO, pausedMs]);
+
 
     const channel = supabase
       .channel("realtime-all")
@@ -244,15 +237,19 @@ const runningHMS = useMemo(() => {
   };
 
   const handleLogout = () => {
-    setRole(null);
-    setCurrentEmployee(null);
-    setSelectedProject("");
-    setStartTime(null);
-    setIsPaused(false);
-    setPausedAt(null);
-    setTotalPausedMs(0);
-    setRunningRecordId(null);
-  };
+  setRole(null);
+  setCurrentEmployee(null);
+  setSelectedProject("");
+  setRunningRecordId(null);
+  setStartISO(null);
+  setPausedMs(0);
+  setPausedAtISO(null);
+  localStorage.removeItem("runningRecordId");
+  localStorage.removeItem("startISO");
+  localStorage.removeItem("pausedMs");
+  localStorage.removeItem("pausedAtISO");
+};
+
 
 // ---------- Mitarbeiter ----------
   const addEmployee = async () => {
@@ -531,19 +528,22 @@ const handleStop = async () => {
 
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
             <select value={selectedProject} onChange={(e) => setSelectedProject(e.target.value)}>
-              <option value="">Projekt wählen</option>
-              {projects.map((p) => (
-                <option key={p.id} value={p.name}>{p.name}</option>
-              ))}
-            </select>
-            <button onClick={handleStart} disabled={!selectedProject || !!startTime}>Start</button>
-            <button onClick={togglePause} disabled={!startTime}>{isPaused ? "Weiter" : "Pause"}</button>
-            <button onClick={handleStop} disabled={!startTime}>Stop</button>
-            {startTime && (
-              <span style={{ marginLeft: 8 }}>
-                Laufzeit: <strong>{runningHMS}</strong>{isPaused ? " (pausiert)" : ""}
-              </span>
-            )}
+  <option value="">Projekt wählen</option>
+  {projects.map((p) => (
+    <option key={p.id} value={p.name}>{p.name}</option>
+  ))}
+</select>
+
+<button onClick={handleStart} disabled={!selectedProject || !!startISO}>Start</button>
+<button onClick={togglePause} disabled={!startISO}>{pausedAtISO ? "Weiter" : "Pause"}</button>
+<button onClick={handleStop} disabled={!startISO}>Stop</button>
+
+{startISO && (
+  <span style={{ marginLeft: 8 }}>
+    Laufzeit: <strong>{runningHMS}</strong>{pausedAtISO ? " (pausiert)" : ""}
+  </span>
+)}
+
           </div>
 
           {/* Projekt-Notiz anzeigen */}
