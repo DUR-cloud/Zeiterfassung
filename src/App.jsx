@@ -1,4 +1,3 @@
-
 // src/App.jsx
 import { useEffect, useMemo, useState } from "react";
 import { jsPDF } from "jspdf";
@@ -9,7 +8,7 @@ import { supabase } from "./supabaseClient.js";
 const LS_KEYS = {
   logo: "zeiterfassung_logo_v3",
   vacations: "zeiterfassung_vacations_v1",
-  legacy_records: "zeiterfassung_records_v3", // alte lokale Zeiten (für Einmal-Migration)
+  legacy_records: "zeiterfassung_records_v3",
 };
 
 const ADMIN_FALLBACK = "chef123"; // simples Admin-Passwort
@@ -77,7 +76,7 @@ export default function App() {
 
   // Auswahl/Erfassung
   const [selectedProject, setSelectedProject] = useState("");
-  const [startTime, setStartTime] = useState(null);
+  const [startTime, setStartTime] = useState(null); // ISO string des laufenden Eintrags
 
   // Pause-Handling
   const [isPaused, setIsPaused] = useState(false);
@@ -210,6 +209,10 @@ export default function App() {
     setRole("admin");
     setLoginPw("");
     setCurrentEmployee(null);
+    setStartTime(null);
+    setIsPaused(false);
+    setPausedAt(null);
+    setTotalPausedMs(0);
   };
 
   const handleEmployeeLogin = async () => {
@@ -221,6 +224,23 @@ export default function App() {
       setCurrentEmployee(emp);
       setLoginName("");
       setEmpPw("");
+
+      // Offenen Record laden und weiterlaufen lassen
+      const { data, error } = await supabase
+        .from("records")
+        .select("*")
+        .eq("employee_id", emp.id)
+        .is("end_iso", null)
+        .maybeSingle();
+
+      if (!error && data) {
+        setStartTime(data.start_iso);
+        setIsPaused(false);
+        setPausedAt(null);
+        setTotalPausedMs(0);
+      } else {
+        setStartTime(null);
+      }
     } else {
       alert("Falsches Passwort");
     }
@@ -302,10 +322,30 @@ export default function App() {
   };
 
 // ---------- Erfassung (Supabase) ----------
-  const handleStart = () => {
+  // Beim Start: sofort offenen DB-Record anlegen
+  const handleStart = async () => {
     if (!currentEmployee) return alert("Bitte als Mitarbeiter einloggen");
     if (!selectedProject) return alert("Bitte Projekt wählen");
-    setStartTime(new Date());
+
+    const proj = projects.find((p) => p.name === selectedProject);
+    if (!proj) return alert("Projekt nicht gefunden");
+
+    const startISO = new Date().toISOString();
+
+    const { error } = await supabase
+      .from("records")
+      .insert({
+        employee_id: currentEmployee.id,
+        project_id: proj.id,
+        start_iso: startISO,
+        end_iso: null,                 // offen
+        duration_minutes: null,        // wird bei Stop berechnet
+        lunch_applied: false,
+      });
+
+    if (error) return alert("Fehler beim Start: " + error.message);
+
+    setStartTime(startISO);
     setIsPaused(false);
     setPausedAt(null);
     setTotalPausedMs(0);
@@ -315,9 +355,8 @@ export default function App() {
     if (!startTime) return;
     if (!isPaused) {
       setIsPaused(true);
-      setPausedAt(new Date());
+      setPausedAt(new Date().toISOString());
     } else {
-      // Pause beenden → aufsummieren
       if (pausedAt) {
         const extra = Date.now() - new Date(pausedAt).getTime();
         setTotalPausedMs((ms) => ms + Math.max(0, extra));
@@ -327,10 +366,11 @@ export default function App() {
     }
   };
 
+  // Beim Stop: offenen DB-Record aktualisieren
   const handleStop = async () => {
     if (!startTime || !currentEmployee) return;
 
-    // offenes Pausenintervall beenden
+    // Offene Pause beenden
     let pausedMs = totalPausedMs;
     if (isPaused && pausedAt) {
       pausedMs += Math.max(0, Date.now() - new Date(pausedAt).getTime());
@@ -340,55 +380,28 @@ export default function App() {
     const startISO = new Date(startTime).toISOString();
     const endISO = end.toISOString();
 
-    // reine Arbeitszeit (ohne Pausen) in Minuten
+    // Netto-Minuten (eigene Pausen)
     const grossMinutes = Math.round((new Date(endISO) - new Date(startISO)) / 60000);
     const pauseMinutes = Math.round(pausedMs / 60000);
     const netBeforeLunch = Math.max(0, grossMinutes - pauseMinutes);
 
-    // zusätzlich automatische Mittagspause, falls überlappt
-    const { minutes: finalMinutes, lunchApplied } = subtractLunchIfNeeded(startISO, endISO);
-    // finalMinutes bezieht sich auf "brutto", daher unsere Pausen noch abziehen:
-    const durationMinutes = Math.max(0, finalMinutes - pauseMinutes);
+    // Automatische Mittagspause (12–13) abziehen
+    const { minutes: finalMinutesGross, lunchApplied } = subtractLunchIfNeeded(startISO, endISO);
+    const durationMinutes = Math.max(0, finalMinutesGross - pauseMinutes);
 
-    // IDs zu Name finden
-    const proj = projects.find((p) => p.name === selectedProject);
-    if (!proj) return alert("Projekt nicht gefunden");
-
-    const { data, error } = await supabase
+    const { error } = await supabase
       .from("records")
-      .insert({
-        employee_id: currentEmployee.id,
-        project_id: proj.id,
-        start_iso: startISO,
+      .update({
         end_iso: endISO,
         duration_minutes: durationMinutes,
         lunch_applied: lunchApplied,
       })
-      .select(`
-        id, employee_id, project_id, start_iso, end_iso, duration_minutes, lunch_applied, created_at,
-        employees:employee_id ( name ),
-        projects:project_id  ( name, note )
-      `)
-      .single();
+      .eq("employee_id", currentEmployee.id)
+      .is("end_iso", null); // nur offenen schließen
 
-    if (error) {
-      alert("Fehler beim Speichern: " + error.message);
-      return;
-    }
+    if (error) return alert("Fehler beim Stop: " + error.message);
 
-    const mapped = {
-      id: data.id,
-      employeeId: data.employee_id,
-      projectId: data.project_id,
-      employee: data.employees?.name ?? "",
-      project: data.projects?.name ?? "",
-      date: new Date(data.start_iso).toLocaleDateString(),
-      startISO: data.start_iso,
-      endISO: data.end_iso,
-      duration: data.duration_minutes,
-      lunchApplied: data.lunch_applied,
-    };
-    setRecords((prev) => [mapped, ...prev]);
+    await loadRecords();
 
     // Reset
     setStartTime(null);
@@ -396,6 +409,26 @@ export default function App() {
     setPausedAt(null);
     setTotalPausedMs(0);
   };
+
+  // Auto-Stop um 17:00
+  useEffect(() => {
+    if (!startTime || !currentEmployee) return;
+
+    const now = new Date();
+    const stopAt = new Date(now);
+    stopAt.setHours(17, 0, 0, 0);
+
+    const msUntilStop = stopAt.getTime() - now.getTime();
+    if (msUntilStop <= 0) return; // 17 Uhr schon vorbei
+
+    const t = setTimeout(() => {
+      // automatisch stoppen (ignoriert, wenn bereits manuell gestoppt wurde)
+      handleStop();
+    }, msUntilStop);
+
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [startTime, currentEmployee?.id]);
 
 // ---------- Urlaub (lokal) ----------
   const handleVacationRequest = () => {
@@ -473,6 +506,12 @@ export default function App() {
     [projects, selectedProject]
   );
 
+  // gefilterte Records für Mitarbeiter-Ansicht (nur eigene)
+  const myRecords = useMemo(() => {
+    if (!currentEmployee) return [];
+    return records.filter(r => r.employee === currentEmployee.name);
+  }, [records, currentEmployee]);
+
   return (
     <div style={{ padding: 16, maxWidth: 980, margin: "0 auto" }}>
       <h2>Digitale Zeiterfassung</h2>
@@ -527,22 +566,18 @@ export default function App() {
             </div>
           )}
 
-          <h4 style={{ marginTop: 16 }}>Zuletzt erfasste Zeiten</h4>
-          {(() => {
-  const myRecords = records.filter(r => r.employeeId === currentEmployee.id);
-  return myRecords.length === 0 ? (
-    <p>Noch keine Einträge</p>
-  ) : (
-    <ul>
-      {myRecords.map((r) => (
-        <li key={r.id}>
-          {r.date} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause 12–13 abgezogen)" : ""}
-        </li>
-      ))}
-    </ul>
-  );
-})()}
-
+          <h4 style={{ marginTop: 16 }}>Meine erfassten Zeiten</h4>
+          {myRecords.length === 0 ? (
+            <p>Noch keine Einträge</p>
+          ) : (
+            <ul>
+              {myRecords.map((r) => (
+                <li key={r.id}>
+                  {r.date} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration ?? "—"} Min {r.lunchApplied ? "(Pause 12–13 abgezogen)" : ""}
+                </li>
+              ))}
+            </ul>
+          )}
 
           {/* Urlaub beantragen */}
           <h4 style={{ marginTop: 16 }}>Urlaub beantragen</h4>
@@ -643,13 +678,13 @@ export default function App() {
             ))}
           </ul>
 
-          {/* Zeiten */}
-          <h4 style={{ marginTop: 16 }}>Zeiten</h4>
+          {/* Zeiten (Admin sieht alle) */}
+          <h4 style={{ marginTop: 16 }}>Alle Zeiten</h4>
           {records.length === 0 ? <p>Keine Einträge</p> : (
             <ul>
               {records.map((r) => (
                 <li key={r.id}>
-                  {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause 12–13 abgezogen)" : ""}
+                  {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration ?? "—"} Min {r.lunchApplied ? "(Pause 12–13 abgezogen)" : ""}
                 </li>
               ))}
             </ul>
