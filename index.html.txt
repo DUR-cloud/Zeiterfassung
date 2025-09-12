@@ -21,6 +21,48 @@
     history.replaceState(null, '', u.toString());
   })();
 </script>
+<script>
+  // 1) ALLE Service Worker & Caches killen (einmalig nach Deploy)
+  (async () => {
+    try {
+      if ('serviceWorker' in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map(r => r.unregister()));
+      }
+      if (window.caches?.keys) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map(k => caches.delete(k)));
+      }
+    } catch (e) {
+      console.warn('SW cleanup warn:', e);
+    }
+    // kleiner Cache-Buster an der URL, damit neue Assets gezogen werden
+    const u = new URL(location.href);
+    u.searchParams.set('v', Date.now().toString());
+    history.replaceState(null, '', u.toString());
+  })();
+
+  // 2) JEDE Runtime-Fehlermeldung direkt im DOM anzeigen (statt weiß)
+  function showFatal(msg) {
+    const el = document.getElementById('root') || document.body;
+    const pre = document.createElement('pre');
+    pre.style.whiteSpace = 'pre-wrap';
+    pre.style.padding = '12px';
+    pre.style.background = '#fff3cd';
+    pre.style.border = '1px solid #ffeeba';
+    pre.style.color = '#856404';
+    pre.textContent = String(msg);
+    el.innerHTML = '';
+    el.appendChild(pre);
+  }
+  window.onerror = (msg, src, line, col, err) => {
+    showFatal(`Fehler: ${msg}\n${err?.stack || ''}`);
+  };
+  window.onunhandledrejection = (e) => {
+    const r = e?.reason;
+    showFatal(`Promise-Fehler: ${r?.message || r}\n${r?.stack || ''}`);
+  };
+</script>
 
   <head>
     <meta charset="UTF-8" />
