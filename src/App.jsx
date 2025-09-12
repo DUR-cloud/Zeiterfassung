@@ -11,9 +11,9 @@ const LS_KEYS = {
   legacy_records: "zeiterfassung_records_v3",
 };
 
-const ADMIN_FALLBACK = "chef123"; // simples Admin-Passwort
+const ADMIN_FALLBACK = "chef123";
 
-// ---------- Hilfsfunktionen ----------
+// ---------- Helpers ----------
 const newId = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 const fmtTime = (d) =>
   d ? new Date(d).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
@@ -51,9 +51,9 @@ function subtractLunchIfNeeded(startISO, endISO) {
   return { minutes, lunchApplied: false };
 }
 
-// ---------- Hauptkomponente ----------
+// ---------- App ----------
 export default function App() {
-  // Rollen: null (Login), "employee", "admin"
+  // Rollen
   const [role, setRole] = useState(null);
 
   // Stammdaten (Supabase)
@@ -63,63 +63,69 @@ export default function App() {
   // Records (Supabase)
   const [records, setRecords] = useState([]);
 
-  // Urlaub (lokal)
+  // Urlaub (lokal) & Logo (lokal)
   const [vacations, setVacations] = useState([]);
-  // Logo (lokal)
   const [logoDataUrl, setLogoDataUrl] = useState(null);
 
   // Logins
-  const [loginPw, setLoginPw] = useState(""); // Admin
-  const [loginName, setLoginName] = useState(""); // Mitarbeiter
-  const [empPw, setEmpPw] = useState(""); // Mitarbeiter
+  const [loginPw, setLoginPw] = useState("");
+  const [loginName, setLoginName] = useState("");
+  const [empPw, setEmpPw] = useState("");
   const [currentEmployee, setCurrentEmployee] = useState(null);
 
   // Auswahl/Erfassung
   const [selectedProject, setSelectedProject] = useState("");
-  const [startTime, setStartTime] = useState(null); // ISO string des laufenden Eintrags
+  const [startTime, setStartTime] = useState(null);
 
   // Pause-Handling
   const [isPaused, setIsPaused] = useState(false);
   const [pausedAt, setPausedAt] = useState(null);
   const [totalPausedMs, setTotalPausedMs] = useState(0);
 
+  // ID des laufenden Datensatzes (für UPDATE beim Stop)
+  const [runningRecordId, setRunningRecordId] = useState(localStorage.getItem("runningRecordId") || null);
+  const [startISO, setStartISO] = useState(localStorage.getItem("startISO") || null);
+  const [pausedMs, setPausedMs] = useState(Number(localStorage.getItem("pausedMs") || 0));
+  const [pausedAtISO, setPausedAtISO] = useState(localStorage.getItem("pausedAtISO") || null);
+
   // Live-Anzeige (Laufzeit)
   const [nowTick, setNowTick] = useState(Date.now());
-  useEffect(() => {
-    if (!startTime) return;
-    const t = setInterval(() => setNowTick(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, [startTime]);
+useEffect(() => {
+  if (!startISO) return;
+  const t = setInterval(() => setNowTick(Date.now()), 1000);
+  return () => clearInterval(t);
+}, [startISO]);
 
-  const runningMillis = useMemo(() => {
-    if (!startTime) return 0;
-    const now = Date.now();
-    const base = now - new Date(startTime).getTime();
-    const pausedExtra = isPaused && pausedAt ? now - new Date(pausedAt).getTime() : 0;
-    return Math.max(0, base - totalPausedMs - pausedExtra);
-  }, [startTime, isPaused, pausedAt, totalPausedMs, nowTick]);
+const runningMillis = useMemo(() => {
+  if (!startISO) return 0;
+  const now = Date.now();
+  const base = now - new Date(startISO).getTime();
+  const pausedExtra = pausedAtISO ? now - new Date(pausedAtISO).getTime() : 0;
+  return Math.max(0, base - pausedMs - pausedExtra);
+}, [startISO, pausedMs, pausedAtISO, nowTick]);
 
-  const runningHMS = useMemo(() => {
-    let s = Math.floor(runningMillis / 1000);
-    const h = Math.floor(s / 3600); s -= h * 3600;
-    const m = Math.floor(s / 60); s -= m * 60;
-    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-  }, [runningMillis]);
+const runningHMS = useMemo(() => {
+  let s = Math.floor(runningMillis / 1000);
+  const h = Math.floor(s / 3600); s -= h * 3600;
+  const m = Math.floor(s / 60); s -= m * 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}, [runningMillis]);
 
-  // Admin-Form „Neuer Mitarbeiter/Projekt“
+
+  // Admin-Form
   const [newEmpName, setNewEmpName] = useState("");
   const [newEmpPw, setNewEmpPw] = useState("");
   const [newProject, setNewProject] = useState("");
   const [newProjectNote, setNewProjectNote] = useState("");
 
-  // Inline-Editing der Projekt-Notizen
-  const [editNotes, setEditNotes] = useState({}); // { [projectId]: "text" }
+  // Inline-Editing Projekt-Notizen
+  const [editNotes, setEditNotes] = useState({});
 
   // Urlaubseingabe
   const [vacStart, setVacStart] = useState("");
   const [vacEnd, setVacEnd] = useState("");
 
-// ---------- Supabase laden ----------
+// ---------- Supabase Laden ----------
   // Employees
   useEffect(() => {
     (async () => {
@@ -128,7 +134,7 @@ export default function App() {
     })();
   }, []);
 
-  // Projects (inkl. note)
+  // Projects
   useEffect(() => {
     (async () => {
       const { data, error } = await supabase.from("projects").select("*").order("name");
@@ -188,6 +194,18 @@ export default function App() {
         await loadRecords();
       } catch {}
     };
+  useEffect(() => {
+  const iv = setInterval(() => {
+    if (!startISO || !runningRecordId) return;
+    const now = new Date();
+    const limit = new Date(startISO);
+    limit.setHours(17, 0, 0, 0); // heute 17:00 (auf Start-Tag bezogen)
+    if (now >= limit) {
+      handleStop(); // feuert Update
+    }
+  }, 30_000); // alle 30s prüfen
+  return () => clearInterval(iv);
+}, [startISO, runningRecordId]); // handleStop ist stabil genug hier
 
     const channel = supabase
       .channel("realtime-all")
@@ -209,10 +227,6 @@ export default function App() {
     setRole("admin");
     setLoginPw("");
     setCurrentEmployee(null);
-    setStartTime(null);
-    setIsPaused(false);
-    setPausedAt(null);
-    setTotalPausedMs(0);
   };
 
   const handleEmployeeLogin = async () => {
@@ -224,23 +238,6 @@ export default function App() {
       setCurrentEmployee(emp);
       setLoginName("");
       setEmpPw("");
-
-      // Offenen Record laden und weiterlaufen lassen
-      const { data, error } = await supabase
-        .from("records")
-        .select("*")
-        .eq("employee_id", emp.id)
-        .is("end_iso", null)
-        .maybeSingle();
-
-      if (!error && data) {
-        setStartTime(data.start_iso);
-        setIsPaused(false);
-        setPausedAt(null);
-        setTotalPausedMs(0);
-      } else {
-        setStartTime(null);
-      }
     } else {
       alert("Falsches Passwort");
     }
@@ -254,9 +251,10 @@ export default function App() {
     setIsPaused(false);
     setPausedAt(null);
     setTotalPausedMs(0);
+    setRunningRecordId(null);
   };
 
-// ---------- Mitarbeiter (Supabase) ----------
+// ---------- Mitarbeiter ----------
   const addEmployee = async () => {
     if (!newEmpName.trim() || !newEmpPw.trim()) return alert("Bitte Name & Passwort eingeben");
     const password_hash = await sha256Hex(newEmpPw);
@@ -284,7 +282,7 @@ export default function App() {
     setEmployees((prev) => prev.map((e) => (e.id === id ? data : e)));
   };
 
-// ---------- Projekte (Supabase) ----------
+// ---------- Projekte ----------
   const addProject = async () => {
     if (!newProject.trim()) return;
     const { data, error } = await supabase
@@ -321,114 +319,109 @@ export default function App() {
     setProjects((prev) => prev.filter((p) => p.id !== id));
   };
 
-// ---------- Erfassung (Supabase) ----------
-  // Beim Start: sofort offenen DB-Record anlegen
+// ---------- Erfassung ----------
   const handleStart = async () => {
-    if (!currentEmployee) return alert("Bitte als Mitarbeiter einloggen");
-    if (!selectedProject) return alert("Bitte Projekt wählen");
+  if (!currentEmployee) return alert("Bitte als Mitarbeiter einloggen");
+  if (!selectedProject) return alert("Bitte Projekt wählen");
 
-    const proj = projects.find((p) => p.name === selectedProject);
-    if (!proj) return alert("Projekt nicht gefunden");
+  // Projekt-ID zu Namen finden
+  const proj = projects.find((p) => p.name === selectedProject);
+  if (!proj) return alert("Projekt nicht gefunden");
 
-    const startISO = new Date().toISOString();
+  // Startzeit jetzt
+  const nowISO = new Date().toISOString();
 
-    const { error } = await supabase
-      .from("records")
-      .insert({
-        employee_id: currentEmployee.id,
-        project_id: proj.id,
-        start_iso: startISO,
-        end_iso: null,                 // offen
-        duration_minutes: null,        // wird bei Stop berechnet
-        lunch_applied: false,
-      });
+  // Beim Start wird EIN Datensatz angelegt: end_iso bleibt NULL, duration_minutes = 0
+  const { data, error } = await supabase
+    .from("records")
+    .insert({
+      employee_id: currentEmployee.id,
+      project_id: proj.id,
+      start_iso: nowISO,
+      duration_minutes: 0,   // ← WICHTIG: niemals null
+      lunch_applied: false
+    })
+    .select("id")
+    .single();
 
-    if (error) return alert("Fehler beim Start: " + error.message);
+  if (error) return alert("Fehler beim Start: " + error.message);
 
-    setStartTime(startISO);
-    setIsPaused(false);
-    setPausedAt(null);
-    setTotalPausedMs(0);
-  };
+  // Laufzustand merken (auch im localStorage, falls Browser zugeht)
+  setRunningRecordId(data.id);
+  setStartISO(nowISO);
+  setPausedMs(0);
+  setPausedAtISO(null);
+  localStorage.setItem("runningRecordId", data.id);
+  localStorage.setItem("startISO", nowISO);
+  localStorage.setItem("pausedMs", "0");
+  localStorage.removeItem("pausedAtISO");
+};
 
   const togglePause = () => {
-    if (!startTime) return;
-    if (!isPaused) {
-      setIsPaused(true);
-      setPausedAt(new Date().toISOString());
-    } else {
-      if (pausedAt) {
-        const extra = Date.now() - new Date(pausedAt).getTime();
-        setTotalPausedMs((ms) => ms + Math.max(0, extra));
-      }
-      setPausedAt(null);
-      setIsPaused(false);
-    }
-  };
+  if (!runningRecordId || !startISO) return;
 
-  // Beim Stop: offenen DB-Record aktualisieren
-  const handleStop = async () => {
-    if (!startTime || !currentEmployee) return;
+  if (!pausedAtISO) {
+    // in Pause gehen
+    const nowISO = new Date().toISOString();
+    setPausedAtISO(nowISO);
+    localStorage.setItem("pausedAtISO", nowISO);
+  } else {
+    // Pause beenden
+    const extra = Date.now() - new Date(pausedAtISO).getTime();
+    const next = Math.max(0, pausedMs + extra);
+    setPausedMs(next);
+    setPausedAtISO(null);
+    localStorage.setItem("pausedMs", String(next));
+    localStorage.removeItem("pausedAtISO");
+  }
+};
 
-    // Offene Pause beenden
-    let pausedMs = totalPausedMs;
-    if (isPaused && pausedAt) {
-      pausedMs += Math.max(0, Date.now() - new Date(pausedAt).getTime());
-    }
 
-    const end = new Date();
-    const startISO = new Date(startTime).toISOString();
-    const endISO = end.toISOString();
+const handleStop = async () => {
+  if (!runningRecordId || !startISO) return;
 
-    // Netto-Minuten (eigene Pausen)
-    const grossMinutes = Math.round((new Date(endISO) - new Date(startISO)) / 60000);
-    const pauseMinutes = Math.round(pausedMs / 60000);
-    const netBeforeLunch = Math.max(0, grossMinutes - pauseMinutes);
+  // Offene Pause berücksichtigen
+  let totalPaused = pausedMs;
+  if (pausedAtISO) {
+    totalPaused += Math.max(0, Date.now() - new Date(pausedAtISO).getTime());
+  }
 
-    // Automatische Mittagspause (12–13) abziehen
-    const { minutes: finalMinutesGross, lunchApplied } = subtractLunchIfNeeded(startISO, endISO);
-    const durationMinutes = Math.max(0, finalMinutesGross - pauseMinutes);
+  const endISO = new Date().toISOString();
 
-    const { error } = await supabase
-      .from("records")
-      .update({
-        end_iso: endISO,
-        duration_minutes: durationMinutes,
-        lunch_applied: lunchApplied,
-      })
-      .eq("employee_id", currentEmployee.id)
-      .is("end_iso", null); // nur offenen schließen
+  // Brutto-Minuten
+  const grossMin = Math.round((new Date(endISO) - new Date(startISO)) / 60000);
+  const pausedMin = Math.round(totalPaused / 60000);
 
-    if (error) return alert("Fehler beim Stop: " + error.message);
+  // Automatische Mittagspause 12–13 zusätzlich abziehen (nur auf das Intervall selbst)
+  const { minutes: lunchAdjusted } = subtractLunchIfNeeded(startISO, endISO);
 
-    await loadRecords();
+  // finale Dauer = (brutto mit Mittag) - eigene Pausen
+  const duration = Math.max(0, lunchAdjusted - pausedMin);
 
-    // Reset
-    setStartTime(null);
-    setIsPaused(false);
-    setPausedAt(null);
-    setTotalPausedMs(0);
-  };
+  const { error } = await supabase
+    .from("records")
+    .update({
+      end_iso: endISO,
+      duration_minutes: duration,
+      lunch_applied: lunchAdjusted !== grossMin
+    })
+    .eq("id", runningRecordId);
 
-  // Auto-Stop um 17:00
-  useEffect(() => {
-    if (!startTime || !currentEmployee) return;
+  if (error) return alert("Fehler beim Stop: " + error.message);
 
-    const now = new Date();
-    const stopAt = new Date(now);
-    stopAt.setHours(17, 0, 0, 0);
+  // Aufräumen
+  setRunningRecordId(null);
+  setStartISO(null);
+  setPausedMs(0);
+  setPausedAtISO(null);
+  localStorage.removeItem("runningRecordId");
+  localStorage.removeItem("startISO");
+  localStorage.removeItem("pausedMs");
+  localStorage.removeItem("pausedAtISO");
 
-    const msUntilStop = stopAt.getTime() - now.getTime();
-    if (msUntilStop <= 0) return; // 17 Uhr schon vorbei
-
-    const t = setTimeout(() => {
-      // automatisch stoppen (ignoriert, wenn bereits manuell gestoppt wurde)
-      handleStop();
-    }, msUntilStop);
-
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [startTime, currentEmployee?.id]);
+  // Liste neu laden
+  await loadRecords();
+};
 
 // ---------- Urlaub (lokal) ----------
   const handleVacationRequest = () => {
@@ -459,7 +452,7 @@ export default function App() {
     reader.readAsDataURL(file);
   };
 
-  // (optional) Einmal-Migration lokaler Zeiten → Supabase
+  // (optional) Migration lokale Zeiten → Supabase
   const migrateLocalRecordsToSupabase = async () => {
     const local = safeParse(localStorage.getItem(LS_KEYS.legacy_records), []);
     if (!Array.isArray(local) || local.length === 0) {
@@ -506,12 +499,7 @@ export default function App() {
     [projects, selectedProject]
   );
 
-  // gefilterte Records für Mitarbeiter-Ansicht (nur eigene)
-  const myRecords = useMemo(() => {
-    if (!currentEmployee) return [];
-    return records.filter(r => r.employee === currentEmployee.name);
-  }, [records, currentEmployee]);
-
+  // ---------- Render ----------
   return (
     <div style={{ padding: 16, maxWidth: 980, margin: "0 auto" }}>
       <h2>Digitale Zeiterfassung</h2>
@@ -566,14 +554,14 @@ export default function App() {
             </div>
           )}
 
-          <h4 style={{ marginTop: 16 }}>Meine erfassten Zeiten</h4>
-          {myRecords.length === 0 ? (
+          <h4 style={{ marginTop: 16 }}>Zuletzt erfasste Zeiten</h4>
+          {records.length === 0 ? (
             <p>Noch keine Einträge</p>
           ) : (
             <ul>
-              {myRecords.map((r) => (
+              {records.map((r) => (
                 <li key={r.id}>
-                  {r.date} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration ?? "—"} Min {r.lunchApplied ? "(Pause 12–13 abgezogen)" : ""}
+                  {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause 12–13 abgezogen)" : ""}
                 </li>
               ))}
             </ul>
@@ -678,13 +666,13 @@ export default function App() {
             ))}
           </ul>
 
-          {/* Zeiten (Admin sieht alle) */}
-          <h4 style={{ marginTop: 16 }}>Alle Zeiten</h4>
+          {/* Zeiten */}
+          <h4 style={{ marginTop: 16 }}>Zeiten</h4>
           {records.length === 0 ? <p>Keine Einträge</p> : (
             <ul>
               {records.map((r) => (
                 <li key={r.id}>
-                  {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration ?? "—"} Min {r.lunchApplied ? "(Pause 12–13 abgezogen)" : ""}
+                  {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause 12–13 abgezogen)" : ""}
                 </li>
               ))}
             </ul>
