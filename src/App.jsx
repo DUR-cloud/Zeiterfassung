@@ -75,7 +75,7 @@ export default function App() {
 
   // Auswahl/Erfassung
   const [selectedProject, setSelectedProject] = useState("");
-  const [startTime, setStartTime] = useState(null);
+  
 
   // Pause-Handling
   const [isPaused, setIsPaused] = useState(false);
@@ -138,16 +138,22 @@ export default function App() {
   }
 
   function openEdit(r) {
-    // Mitarbeiter dürfen nur eigene Einträge editieren
-    if (role === "employee" && currentEmployee && r.employeeId !== currentEmployee.id) {
-      alert("Du kannst nur deine eigenen Zeiten bearbeiten.");
-      return;
-    }
-    setEditId(r.id);
-    setEditProjectId(r.projectId);
-    setEditStart(toLocalInput(r.startISO));
-    setEditEnd(toLocalInput(r.endISO));
+  // Mitarbeiter dürfen nur eigene Einträge editieren
+  if (role === "employee" && currentEmployee && r.employeeId !== currentEmployee.id) {
+    alert("Du kannst nur deine eigenen Zeiten bearbeiten.");
+    return;
   }
+  setEditId(r.id);
+  setEditProjectId(r.projectId);
+  setEditStart(toLocalInput(r.startISO));
+  setEditEnd(toLocalInput(r.endISO));
+
+  // Scroll zum Editor
+  setTimeout(() => {
+    window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+  }, 0);
+}
+
 
   function cancelEdit() {
     setEditId(null);
@@ -157,21 +163,26 @@ export default function App() {
   }
 
   async function saveEdit() {
-    if (!editId) return;
-    const startISO = fromLocalInput(editStart);
-    const endISO = fromLocalInput(editEnd);
-    if (!startISO || !endISO) return alert("Bitte Start und Ende setzen.");
-    if (new Date(endISO) <= new Date(startISO)) return alert("Ende muss nach Start liegen.");
+  if (!editId) return;
+  const startISO = fromLocalInput(editStart);
+  const endISO = fromLocalInput(editEnd);
+  if (!startISO || !endISO) return alert("Bitte Start und Ende setzen.");
+  if (new Date(endISO) <= new Date(startISO)) return alert("Ende muss nach Start liegen.");
 
-    // Dauer neu berechnen (inkl. Mittag)
-    const grossMin = Math.round((new Date(endISO) - new Date(startISO)) / 60000);
-    const { minutes: lunchAdjusted } = subtractLunchIfNeeded(startISO, endISO);
-    const duration = Math.max(0, lunchAdjusted);
+  // Dauer neu berechnen (inkl. Mittag)
+  const grossMin = Math.round((new Date(endISO) - new Date(startISO)) / 60000);
+  const { minutes: lunchAdjusted } = subtractLunchIfNeeded(startISO, endISO);
+  const duration = Math.max(0, lunchAdjusted);
 
+  // Fallback: falls aus Versehen leer, verwende bisherigen projectId aus dem Datensatz
+  const current = records.find(r => r.id === editId);
+  const project_id = editProjectId || current?.projectId;
+
+  try {
     const { data, error } = await supabase
       .from("records")
       .update({
-        project_id: editProjectId || null,
+        project_id,
         start_iso: startISO,
         end_iso: endISO,
         duration_minutes: duration,
@@ -185,7 +196,10 @@ export default function App() {
       `)
       .single();
 
-    if (error) return alert("Fehler beim Speichern: " + error.message);
+    if (error) {
+      console.error("UPDATE error", error);
+      return alert("Fehler beim Speichern: " + (error.message || JSON.stringify(error)));
+    }
 
     setRecords(prev => prev.map(r => r.id === editId ? {
       id: data.id,
@@ -201,21 +215,35 @@ export default function App() {
     } : r));
 
     cancelEdit();
+  } catch (e) {
+    console.error("UPDATE exception", e);
+    alert("Fehler beim Speichern (Netzwerk/Client): " + (e?.message || e));
   }
+}
+
 
   async function deleteRecord(id) {
-    const rec = records.find(r => r.id === id);
-    if (!rec) return;
-    if (role === "employee" && currentEmployee && rec.employeeId !== currentEmployee.id) {
-      return alert("Du kannst nur deine eigenen Zeiten löschen.");
-    }
-    if (!confirm("Diesen Eintrag wirklich löschen?")) return;
+  const rec = records.find(r => r.id === id);
+  if (!rec) return;
+  if (role === "employee" && currentEmployee && rec.employeeId !== currentEmployee.id) {
+    return alert("Du kannst nur deine eigenen Zeiten löschen.");
+  }
+  if (!confirm("Diesen Eintrag wirklich löschen?")) return;
 
+  try {
     const { error } = await supabase.from("records").delete().eq("id", id);
-    if (error) return alert("Fehler beim Löschen: " + error.message);
+    if (error) {
+      console.error("DELETE error", error);
+      return alert("Fehler beim Löschen: " + (error.message || JSON.stringify(error)));
+    }
     setRecords(prev => prev.filter(r => r.id !== id));
     if (editId === id) cancelEdit();
+  } catch (e) {
+    console.error("DELETE exception", e);
+    alert("Fehler beim Löschen (Netzwerk/Client): " + (e?.message || e));
   }
+}
+
 
   // ---------- Supabase Laden ----------
   useEffect(() => {
@@ -401,7 +429,7 @@ export default function App() {
   };
 
   const handleStop = async () => {
-    if (!startTime || !currentEmployee) return;
+    if (!startISO || !currentEmployee) return;
 
     // offene Pause beenden
     let pausedMs = totalPausedMs;
@@ -525,21 +553,31 @@ export default function App() {
           <button onClick={handleLogout} style={{ marginBottom: 8 }}>Logout</button>
 
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-            <select value={selectedProject} onChange={(e) => setSelectedProject(e.target.value)}>
-              <option value="">Projekt wählen</option>
-              {projects.map((p) => (
-                <option key={p.id} value={p.name}>{p.name}</option>
-              ))}
-            </select>
-            <button onClick={handleStart} disabled={!selectedProject || !!startTime}>Start</button>
-            <button onClick={togglePause} disabled={!startTime}>{isPaused ? "Weiter" : "Pause"}</button>
-            <button onClick={handleStop} disabled={!startTime}>Stop</button>
-            {startTime && (
-              <span style={{ marginLeft: 8 }}>
-                Laufzeit: <strong>{runningHMS}</strong>{isPaused ? " (pausiert)" : ""}
-              </span>
-            )}
-          </div>
+  <select value={selectedProject} onChange={(e) => setSelectedProject(e.target.value)}>
+    <option value="">Projekt wählen</option>
+    {projects.map((p) => (
+      <option key={p.id} value={p.name}>{p.name}</option>
+    ))}
+  </select>
+
+  {/* Start ist deaktiviert, wenn kein Projekt gewählt ODER bereits ein Lauf aktiv ist */}
+  <button onClick={handleStart} disabled={!selectedProject || !!startISO}>Start</button>
+
+  {/* Pause/Weiter ist nur aktiv, wenn ein Lauf aktiv ist */}
+  <button onClick={togglePause} disabled={!startISO}>
+    {pausedAtISO ? "Weiter" : "Pause"}
+  </button>
+
+  {/* Stop ist nur aktiv, wenn ein Lauf aktiv ist */}
+  <button onClick={handleStop} disabled={!startISO}>Stop</button>
+
+  {startISO && (
+    <span style={{ marginLeft: 8 }}>
+      Laufzeit: <strong>{runningHMS}</strong>{pausedAtISO ? " (pausiert)" : ""}
+    </span>
+  )}
+</div>
+
 
           {/* Projekt-Notiz anzeigen */}
           {selectedProjectObj && (
