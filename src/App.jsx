@@ -45,10 +45,32 @@ function subtractLunchIfNeeded(startISO, endISO) {
 
   const lunchStart = new Date(start); lunchStart.setHours(12, 0, 0, 0);
   const lunchEnd   = new Date(start); lunchEnd.setHours(13, 0, 0, 0);
-  const overlap = Math.max(0, Math.min(end.getTime(), lunchEnd.getTime()) - Math.max(start.getTime(), lunchStart.getTime()));
+  const overlap = Math.max(
+    0,
+    Math.min(end.getTime(), lunchEnd.getTime()) - Math.max(start.getTime(), lunchStart.getTime())
+  );
   const overlapMin = Math.round(overlap / 60000);
   if (overlapMin > 0) return { minutes: Math.max(0, minutes - overlapMin), lunchApplied: true };
   return { minutes, lunchApplied: false };
+}
+
+// ----- DateTime Helpers für <input type="datetime-local"> -----
+function toLocalInputValue(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  const pad = (n) => String(n).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  const mm = pad(d.getMonth() + 1);
+  const dd = pad(d.getDate());
+  const hh = pad(d.getHours());
+  const min = pad(d.getMinutes());
+  return `${yyyy}-${mm}-${dd}T${hh}:${min}`;
+}
+function fromLocalInputToISO(localStr) {
+  if (!localStr) return null;
+  const d = new Date(localStr);
+  if (isNaN(d)) return null;
+  return d.toISOString();
 }
 
 // ---------- App ----------
@@ -75,29 +97,27 @@ export default function App() {
 
   // Auswahl/Erfassung
   const [selectedProject, setSelectedProject] = useState("");
-  
 
-  // Pause-Handling
-  const [isPaused, setIsPaused] = useState(false);
-  const [pausedAt, setPausedAt] = useState(null);
-  const [totalPausedMs, setTotalPausedMs] = useState(0);
+  // Laufende Zeit (persistiert, damit Handy-Browser/Tab schließen nichts stoppt)
+  const [runningRecordId, setRunningRecordId] = useState(localStorage.getItem("runningRecordId") || null);
+  const [startISO, setStartISO] = useState(localStorage.getItem("startISO") || null);
+  const [pausedMs, setPausedMs] = useState(Number(localStorage.getItem("pausedMs") || 0));
+  const [pausedAtISO, setPausedAtISO] = useState(localStorage.getItem("pausedAtISO") || null);
 
-  // Live-Anzeige (Laufzeit)
+  // Live-Anzeige
   const [nowTick, setNowTick] = useState(Date.now());
   useEffect(() => {
-    if (!startTime) return;
+    if (!startISO) return;
     const t = setInterval(() => setNowTick(Date.now()), 1000);
     return () => clearInterval(t);
-  }, [startTime]);
-
+  }, [startISO]);
   const runningMillis = useMemo(() => {
-    if (!startTime) return 0;
+    if (!startISO) return 0;
     const now = Date.now();
-    const base = now - new Date(startTime).getTime();
-    const pausedExtra = isPaused && pausedAt ? now - new Date(pausedAt).getTime() : 0;
-    return Math.max(0, base - totalPausedMs - pausedExtra);
-  }, [startTime, isPaused, pausedAt, totalPausedMs, nowTick]);
-
+    const base = now - new Date(startISO).getTime();
+    const pausedExtra = pausedAtISO ? now - new Date(pausedAtISO).getTime() : 0;
+    return Math.max(0, base - pausedMs - pausedExtra);
+  }, [startISO, pausedMs, pausedAtISO, nowTick]);
   const runningHMS = useMemo(() => {
     let s = Math.floor(runningMillis / 1000);
     const h = Math.floor(s / 3600); s -= h * 3600;
@@ -118,150 +138,32 @@ export default function App() {
   const [vacStart, setVacStart] = useState("");
   const [vacEnd, setVacEnd] = useState("");
 
-  // ---------- Edit-Dialog für Records ----------
-  const [editId, setEditId] = useState(null);
-  const [editStart, setEditStart] = useState("");
-  const [editEnd, setEditEnd] = useState("");
-  const [editProjectId, setEditProjectId] = useState("");
-
-  function toLocalInput(dtISO) {
-    if (!dtISO) return "";
-    const d = new Date(dtISO);
-    d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
-    return d.toISOString().slice(0, 16); // 'YYYY-MM-DDTHH:mm'
-  }
-  function fromLocalInput(localStr) {
-    if (!localStr) return null;
-    const d = new Date(localStr);
-    d.setMinutes(d.getMinutes() + d.getTimezoneOffset());
-    return d.toISOString();
-  }
-
-  function openEdit(r) {
-  // Mitarbeiter dürfen nur eigene Einträge editieren
-  if (role === "employee" && currentEmployee && r.employeeId !== currentEmployee.id) {
-    alert("Du kannst nur deine eigenen Zeiten bearbeiten.");
-    return;
-  }
-  setEditId(r.id);
-  setEditProjectId(r.projectId);
-  setEditStart(toLocalInput(r.startISO));
-  setEditEnd(toLocalInput(r.endISO));
-
-  // Scroll zum Editor
-  setTimeout(() => {
-    window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
-  }, 0);
-}
-
-
-  function cancelEdit() {
-    setEditId(null);
-    setEditProjectId("");
-    setEditStart("");
-    setEditEnd("");
-  }
-
-  async function saveEdit() {
-  if (!editId) return;
-  const startISO = fromLocalInput(editStart);
-  const endISO = fromLocalInput(editEnd);
-  if (!startISO || !endISO) return alert("Bitte Start und Ende setzen.");
-  if (new Date(endISO) <= new Date(startISO)) return alert("Ende muss nach Start liegen.");
-
-  // Dauer neu berechnen (inkl. Mittag)
-  const grossMin = Math.round((new Date(endISO) - new Date(startISO)) / 60000);
-  const { minutes: lunchAdjusted } = subtractLunchIfNeeded(startISO, endISO);
-  const duration = Math.max(0, lunchAdjusted);
-
-  // Fallback: falls aus Versehen leer, verwende bisherigen projectId aus dem Datensatz
-  const current = records.find(r => r.id === editId);
-  const project_id = editProjectId || current?.projectId;
-
-  try {
-    const { data, error } = await supabase
-      .from("records")
-      .update({
-        project_id,
-        start_iso: startISO,
-        end_iso: endISO,
-        duration_minutes: duration,
-        lunch_applied: lunchAdjusted !== grossMin
-      })
-      .eq("id", editId)
-      .select(`
-        id, employee_id, project_id, start_iso, end_iso, duration_minutes, lunch_applied, created_at,
-        employees:employee_id ( name ),
-        projects:project_id  ( name, note )
-      `)
-      .single();
-
-    if (error) {
-      console.error("UPDATE error", error);
-      return alert("Fehler beim Speichern: " + (error.message || JSON.stringify(error)));
-    }
-
-    setRecords(prev => prev.map(r => r.id === editId ? {
-      id: data.id,
-      employeeId: data.employee_id,
-      projectId: data.project_id,
-      employee: data.employees?.name ?? "",
-      project: data.projects?.name ?? "",
-      date: new Date(data.start_iso).toLocaleDateString(),
-      startISO: data.start_iso,
-      endISO: data.end_iso,
-      duration: data.duration_minutes,
-      lunchApplied: data.lunch_applied,
-    } : r));
-
-    cancelEdit();
-  } catch (e) {
-    console.error("UPDATE exception", e);
-    alert("Fehler beim Speichern (Netzwerk/Client): " + (e?.message || e));
-  }
-}
-
-
-  async function deleteRecord(id) {
-  const rec = records.find(r => r.id === id);
-  if (!rec) return;
-  if (role === "employee" && currentEmployee && rec.employeeId !== currentEmployee.id) {
-    return alert("Du kannst nur deine eigenen Zeiten löschen.");
-  }
-  if (!confirm("Diesen Eintrag wirklich löschen?")) return;
-
-  try {
-    const { error } = await supabase.from("records").delete().eq("id", id);
-    if (error) {
-      console.error("DELETE error", error);
-      return alert("Fehler beim Löschen: " + (error.message || JSON.stringify(error)));
-    }
-    setRecords(prev => prev.filter(r => r.id !== id));
-    if (editId === id) cancelEdit();
-  } catch (e) {
-    console.error("DELETE exception", e);
-    alert("Fehler beim Löschen (Netzwerk/Client): " + (e?.message || e));
-  }
-}
-
+  // ----- Edit-Dialog State -----
+  const [editOpen, setEditOpen] = useState(false);
+  const [editData, setEditData] = useState({
+    id: null,
+    employeeId: null,
+    projectId: "",
+    startISO: "",
+    endISO: "",
+  });
 
   // ---------- Supabase Laden ----------
   useEffect(() => {
     (async () => {
-      const { data } = await supabase.from("employees").select("*").order("name");
-      if (Array.isArray(data)) setEmployees(data);
+      const { data, error } = await supabase.from("employees").select("*").order("name");
+      if (!error && Array.isArray(data)) setEmployees(data);
     })();
   }, []);
-
   useEffect(() => {
     (async () => {
-      const { data } = await supabase.from("projects").select("*").order("name");
-      if (Array.isArray(data)) setProjects(data);
+      const { data, error } = await supabase.from("projects").select("*").order("name");
+      if (!error && Array.isArray(data)) setProjects(data);
     })();
   }, []);
 
   const loadRecords = async () => {
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from("records")
       .select(`
         id, employee_id, project_id, start_iso, end_iso, duration_minutes, lunch_applied, created_at,
@@ -269,21 +171,21 @@ export default function App() {
         projects:project_id  ( name, note )
       `)
       .order("created_at", { ascending: false });
-    if (Array.isArray(data)) {
-      setRecords(
-        data.map((r) => ({
-          id: r.id,
-          employeeId: r.employee_id,
-          projectId: r.project_id,
-          employee: r.employees?.name ?? "",
-          project: r.projects?.name ?? "",
-          date: new Date(r.start_iso).toLocaleDateString(),
-          startISO: r.start_iso,
-          endISO: r.end_iso,
-          duration: r.duration_minutes,
-          lunchApplied: r.lunch_applied,
-        }))
-      );
+
+    if (!error && Array.isArray(data)) {
+      const mapped = data.map((r) => ({
+        id: r.id,
+        employeeId: r.employee_id,
+        projectId: r.project_id,
+        employee: r.employees?.name ?? "",
+        project: r.projects?.name ?? "",
+        date: new Date(r.start_iso).toLocaleDateString(),
+        startISO: r.start_iso,
+        endISO: r.end_iso,
+        duration: r.duration_minutes,
+        lunchApplied: r.lunch_applied,
+      }));
+      setRecords(mapped);
     }
   };
   useEffect(() => { loadRecords(); }, []);
@@ -298,10 +200,32 @@ export default function App() {
   useEffect(() => { localStorage.setItem(LS_KEYS.vacations, JSON.stringify(vacations)); }, [vacations]);
   useEffect(() => { if (logoDataUrl) localStorage.setItem(LS_KEYS.logo, logoDataUrl); }, [logoDataUrl]);
 
-  // (optional) Realtime + Polling (einfach: Polling)
+  // Realtime + Polling
   useEffect(() => {
-    const poll = setInterval(loadRecords, 10000);
-    return () => clearInterval(poll);
+    const reloadAll = async () => {
+      try {
+        const [empRes, projRes] = await Promise.all([
+          supabase.from("employees").select("*").order("name"),
+          supabase.from("projects").select("*").order("name"),
+        ]);
+        if (!empRes.error) setEmployees(empRes.data ?? []);
+        if (!projRes.error) setProjects(projRes.data ?? []);
+        await loadRecords();
+      } catch {}
+    };
+
+    const channel = supabase
+      .channel("realtime-all")
+      .on("postgres_changes", { event: "*", schema: "public", table: "records"  }, reloadAll)
+      .on("postgres_changes", { event: "*", schema: "public", table: "projects" }, reloadAll)
+      .on("postgres_changes", { event: "*", schema: "public", table: "employees"}, reloadAll)
+      .subscribe();
+
+    const poll = setInterval(reloadAll, 10000);
+    return () => {
+      supabase.removeChannel(channel);
+      clearInterval(poll);
+    };
   }, []);
 
   // ---------- Logins ----------
@@ -330,11 +254,15 @@ export default function App() {
     setRole(null);
     setCurrentEmployee(null);
     setSelectedProject("");
-    setStartTime(null);
-    setIsPaused(false);
-    setPausedAt(null);
-    setTotalPausedMs(0);
-    cancelEdit();
+    // Laufstatus zurücksetzen
+    setRunningRecordId(null);
+    setStartISO(null);
+    setPausedMs(0);
+    setPausedAtISO(null);
+    localStorage.removeItem("runningRecordId");
+    localStorage.removeItem("startISO");
+    localStorage.removeItem("pausedMs");
+    localStorage.removeItem("pausedAtISO");
   };
 
   // ---------- Mitarbeiter ----------
@@ -403,73 +331,156 @@ export default function App() {
   };
 
   // ---------- Erfassung ----------
-  const handleStart = () => {
+  const handleStart = async () => {
     if (!currentEmployee) return alert("Bitte als Mitarbeiter einloggen");
     if (!selectedProject) return alert("Bitte Projekt wählen");
-    setStartTime(new Date());
-    setIsPaused(false);
-    setPausedAt(null);
-    setTotalPausedMs(0);
-  };
 
-  const togglePause = () => {
-    if (!startTime) return;
-    if (!isPaused) {
-      setIsPaused(true);
-      setPausedAt(new Date());
-    } else {
-      // Pause beenden → aufsummieren
-      if (pausedAt) {
-        const extra = Date.now() - new Date(pausedAt).getTime();
-        setTotalPausedMs((ms) => ms + Math.max(0, extra));
-      }
-      setPausedAt(null);
-      setIsPaused(false);
-    }
-  };
-
-  const handleStop = async () => {
-    if (!startISO || !currentEmployee) return;
-
-    // offene Pause beenden
-    let pausedMs = totalPausedMs;
-    if (isPaused && pausedAt) {
-      pausedMs += Math.max(0, Date.now() - new Date(pausedAt).getTime());
-    }
-
-    const end = new Date();
-    const startISO = new Date(startTime).toISOString();
-    const endISO = end.toISOString();
-
-    const grossMinutes = Math.round((new Date(endISO) - new Date(startISO)) / 60000);
-    const pauseMinutes = Math.round(pausedMs / 60000);
-    const { minutes: finalMinutes, lunchApplied } = subtractLunchIfNeeded(startISO, endISO);
-    const durationMinutes = Math.max(0, finalMinutes - pauseMinutes);
-
-    // IDs zu Name finden
     const proj = projects.find((p) => p.name === selectedProject);
     if (!proj) return alert("Projekt nicht gefunden");
 
+    const nowISO = new Date().toISOString();
     const { data, error } = await supabase
       .from("records")
       .insert({
         employee_id: currentEmployee.id,
         project_id: proj.id,
-        start_iso: startISO,
-        end_iso: endISO,
-        duration_minutes: durationMinutes,
-        lunch_applied: lunchApplied,
+        start_iso: nowISO,
+        duration_minutes: 0,   // niemals null
+        lunch_applied: false
       })
+      .select("id")
+      .single();
+
+    if (error) return alert("Fehler beim Start: " + error.message);
+
+    setRunningRecordId(data.id);
+    setStartISO(nowISO);
+    setPausedMs(0);
+    setPausedAtISO(null);
+    localStorage.setItem("runningRecordId", data.id);
+    localStorage.setItem("startISO", nowISO);
+    localStorage.setItem("pausedMs", "0");
+    localStorage.removeItem("pausedAtISO");
+  };
+
+  const togglePause = () => {
+    if (!runningRecordId || !startISO) return;
+
+    if (!pausedAtISO) {
+      // in Pause gehen
+      const nowISO = new Date().toISOString();
+      setPausedAtISO(nowISO);
+      localStorage.setItem("pausedAtISO", nowISO);
+    } else {
+      // Pause beenden
+      const extra = Date.now() - new Date(pausedAtISO).getTime();
+      const next = Math.max(0, pausedMs + extra);
+      setPausedMs(next);
+      setPausedAtISO(null);
+      localStorage.setItem("pausedMs", String(next));
+      localStorage.removeItem("pausedAtISO");
+    }
+  };
+
+  const handleStop = async () => {
+    if (!runningRecordId || !startISO) return;
+
+    // Offene Pause berücksichtigen
+    let totalPaused = pausedMs;
+    if (pausedAtISO) {
+      totalPaused += Math.max(0, Date.now() - new Date(pausedAtISO).getTime());
+    }
+
+    const endISO = new Date().toISOString();
+
+    // Brutto-Minuten
+    const grossMin = Math.round((new Date(endISO) - new Date(startISO)) / 60000);
+    const pausedMin = Math.round(totalPaused / 60000);
+
+    // Automatische Mittagspause 12–13 zusätzlich abziehen (nur auf das Intervall selbst)
+    const { minutes: lunchAdjusted } = subtractLunchIfNeeded(startISO, endISO);
+
+    // finale Dauer = (brutto mit Mittag) - eigene Pausen
+    const duration = Math.max(0, lunchAdjusted - pausedMin);
+
+    const { error } = await supabase
+      .from("records")
+      .update({
+        end_iso: endISO,
+        duration_minutes: duration,
+        lunch_applied: lunchAdjusted !== grossMin
+      })
+      .eq("id", runningRecordId);
+
+    if (error) return alert("Fehler beim Stop: " + error.message);
+
+    // Aufräumen + Liste aktualisieren
+    setRunningRecordId(null);
+    setStartISO(null);
+    setPausedMs(0);
+    setPausedAtISO(null);
+    localStorage.removeItem("runningRecordId");
+    localStorage.removeItem("startISO");
+    localStorage.removeItem("pausedMs");
+    localStorage.removeItem("pausedAtISO");
+
+    await loadRecords();
+  };
+
+  // ----- Zeiten bearbeiten -----
+  function openEdit(r) {
+    if (role === "employee" && currentEmployee && r.employeeId !== currentEmployee.id) {
+      alert("Du kannst nur deine eigenen Zeiten bearbeiten.");
+      return;
+    }
+    setEditData({
+      id: r.id,
+      employeeId: r.employeeId,
+      projectId: r.projectId,
+      startISO: r.startISO,
+      endISO: r.endISO,
+    });
+    setEditOpen(true);
+  }
+  function closeEdit() {
+    setEditOpen(false);
+    setEditData({ id: null, employeeId: null, projectId: "", startISO: "", endISO: "" });
+  }
+  async function saveEdit() {
+    if (!editData.id) return;
+    if (!editData.projectId) return alert("Bitte ein Projekt wählen.");
+    if (!editData.startISO || !editData.endISO) return alert("Start und Ende müssen gesetzt sein.");
+    if (new Date(editData.endISO) <= new Date(editData.startISO)) {
+      return alert("Ende muss nach Start liegen.");
+    }
+
+    const totalMin = Math.round((new Date(editData.endISO) - new Date(editData.startISO)) / 60000);
+    const { minutes: lunchAdjusted } = subtractLunchIfNeeded(editData.startISO, editData.endISO);
+    const duration = Math.max(0, lunchAdjusted);
+
+    const { data, error } = await supabase
+      .from("records")
+      .update({
+        project_id: editData.projectId,
+        start_iso: editData.startISO,
+        end_iso: editData.endISO,
+        duration_minutes: duration,
+        lunch_applied: lunchAdjusted !== totalMin,
+      })
+      .eq("id", editData.id)
       .select(`
-        id, employee_id, project_id, start_iso, end_iso, duration_minutes, lunch_applied, created_at,
+        id, employee_id, project_id, start_iso, end_iso, duration_minutes, lunch_applied,
         employees:employee_id ( name ),
         projects:project_id  ( name, note )
       `)
       .single();
 
-    if (error) return alert("Fehler beim Speichern: " + error.message);
+    if (error) {
+      alert("Fehler beim Speichern: " + error.message);
+      return;
+    }
 
-    const mapped = {
+    const updated = {
       id: data.id,
       employeeId: data.employee_id,
       projectId: data.project_id,
@@ -481,14 +492,9 @@ export default function App() {
       duration: data.duration_minutes,
       lunchApplied: data.lunch_applied,
     };
-    setRecords((prev) => [mapped, ...prev]);
-
-    // Reset
-    setStartTime(null);
-    setIsPaused(false);
-    setPausedAt(null);
-    setTotalPausedMs(0);
-  };
+    setRecords((prev) => prev.map((x) => (x.id === updated.id ? updated : x)));
+    closeEdit();
+  }
 
   // ---------- Urlaub (lokal) ----------
   const handleVacationRequest = () => {
@@ -516,7 +522,6 @@ export default function App() {
     () => (currentEmployee ? vacations.filter((v) => v.employeeId === currentEmployee.id) : []),
     [vacations, currentEmployee]
   );
-
   const selectedProjectObj = useMemo(
     () => projects.find((x) => x.name === selectedProject) || null,
     [projects, selectedProject]
@@ -553,31 +558,21 @@ export default function App() {
           <button onClick={handleLogout} style={{ marginBottom: 8 }}>Logout</button>
 
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-  <select value={selectedProject} onChange={(e) => setSelectedProject(e.target.value)}>
-    <option value="">Projekt wählen</option>
-    {projects.map((p) => (
-      <option key={p.id} value={p.name}>{p.name}</option>
-    ))}
-  </select>
-
-  {/* Start ist deaktiviert, wenn kein Projekt gewählt ODER bereits ein Lauf aktiv ist */}
-  <button onClick={handleStart} disabled={!selectedProject || !!startISO}>Start</button>
-
-  {/* Pause/Weiter ist nur aktiv, wenn ein Lauf aktiv ist */}
-  <button onClick={togglePause} disabled={!startISO}>
-    {pausedAtISO ? "Weiter" : "Pause"}
-  </button>
-
-  {/* Stop ist nur aktiv, wenn ein Lauf aktiv ist */}
-  <button onClick={handleStop} disabled={!startISO}>Stop</button>
-
-  {startISO && (
-    <span style={{ marginLeft: 8 }}>
-      Laufzeit: <strong>{runningHMS}</strong>{pausedAtISO ? " (pausiert)" : ""}
-    </span>
-  )}
-</div>
-
+            <select value={selectedProject} onChange={(e) => setSelectedProject(e.target.value)}>
+              <option value="">Projekt wählen</option>
+              {projects.map((p) => (
+                <option key={p.id} value={p.name}>{p.name}</option>
+              ))}
+            </select>
+            <button onClick={handleStart} disabled={!selectedProject || !!runningRecordId}>Start</button>
+            <button onClick={togglePause} disabled={!runningRecordId}>{pausedAtISO ? "Weiter" : "Pause"}</button>
+            <button onClick={handleStop} disabled={!runningRecordId}>Stop</button>
+            {startISO && (
+              <span style={{ marginLeft: 8 }}>
+                Laufzeit: <strong>{runningHMS}</strong>{pausedAtISO ? " (pausiert)" : ""}
+              </span>
+            )}
+          </div>
 
           {/* Projekt-Notiz anzeigen */}
           {selectedProjectObj && (
@@ -591,16 +586,14 @@ export default function App() {
           {records.filter(r => r.employeeId === currentEmployee.id).length === 0 ? (
             <p>Noch keine Einträge</p>
           ) : (
-            <ul>
+            <ul style={{ paddingLeft: 16 }}>
               {records
                 .filter(r => r.employeeId === currentEmployee.id)
                 .map((r) => (
-                  <li key={r.id}>
+                  <li key={r.id} style={{ marginBottom: 6 }}>
                     {r.date} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause 12–13 abgezogen)" : ""}
                     {" "}
-                    <button onClick={() => openEdit(r)}>Bearbeiten</button>
-                    {" "}
-                    <button onClick={() => deleteRecord(r.id)}>Löschen</button>
+                    <button onClick={() => openEdit(r)} style={{ marginLeft: 8 }}>Bearbeiten</button>
                   </li>
                 ))}
             </ul>
@@ -620,6 +613,75 @@ export default function App() {
             ))}
           </ul>
         </section>
+      )}
+
+      {/* ---------- Edit-Dialog (global) ---------- */}
+      {editOpen && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.35)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+            zIndex: 9999,
+          }}
+          onClick={closeEdit}
+        >
+          <div
+            style={{ background: "#fff", borderRadius: 8, padding: 16, width: "min(560px, 95vw)" }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ marginTop: 0 }}>Zeit bearbeiten</h3>
+
+            <div style={{ display: "grid", gap: 10 }}>
+              <label>
+                Projekt
+                <select
+                  value={editData.projectId || ""}
+                  onChange={(e) => setEditData((s) => ({ ...s, projectId: e.target.value }))}
+                  style={{ width: "100%" }}
+                >
+                  <option value="">Bitte wählen…</option>
+                  {projects.map((p) => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Start
+                <input
+                  type="datetime-local"
+                  value={toLocalInputValue(editData.startISO)}
+                  onChange={(e) =>
+                    setEditData((s) => ({ ...s, startISO: fromLocalInputToISO(e.target.value) }))
+                  }
+                  style={{ width: "100%" }}
+                />
+              </label>
+
+              <label>
+                Ende
+                <input
+                  type="datetime-local"
+                  value={toLocalInputValue(editData.endISO)}
+                  onChange={(e) =>
+                    setEditData((s) => ({ ...s, endISO: fromLocalInputToISO(e.target.value) }))
+                  }
+                  style={{ width: "100%" }}
+                />
+              </label>
+            </div>
+
+            <div style={{ display: "flex", gap: 8, marginTop: 14, justifyContent: "flex-end" }}>
+              <button onClick={closeEdit}>Abbrechen</button>
+              <button onClick={saveEdit}>Speichern</button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* ---------- Admin-Ansicht ---------- */}
@@ -708,14 +770,12 @@ export default function App() {
           {/* Zeiten */}
           <h4 style={{ marginTop: 16 }}>Zeiten</h4>
           {records.length === 0 ? <p>Keine Einträge</p> : (
-            <ul>
+            <ul style={{ paddingLeft: 16 }}>
               {records.map((r) => (
-                <li key={r.id}>
+                <li key={r.id} style={{ marginBottom: 6 }}>
                   {r.date} | {r.employee} | {r.project} | {fmtTime(r.startISO)}–{fmtTime(r.endISO)} | {r.duration} Min {r.lunchApplied ? "(Pause 12–13 abgezogen)" : ""}
                   {" "}
-                  <button onClick={() => openEdit(r)}>Bearbeiten</button>
-                  {" "}
-                  <button onClick={() => deleteRecord(r.id)}>Löschen</button>
+                  <button onClick={() => openEdit(r)} style={{ marginLeft: 8 }}>Bearbeiten</button>
                 </li>
               ))}
             </ul>
@@ -785,53 +845,58 @@ export default function App() {
               PDF
             </button>
           </div>
-        </section>
-      )}
 
-      {/* ---------- Edit-Dialog (für Mitarbeiter-eigene oder Admin-alle) ---------- */}
-      {editId && (
-        <div style={{ marginTop: 16, padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
-          <h4>Eintrag bearbeiten</h4>
-          <div style={{ display: "grid", gap: 8, maxWidth: 520 }}>
-            <label>
-              Projekt
-              <select
-                value={editProjectId}
-                onChange={(e) => setEditProjectId(e.target.value)}
-              >
-                <option value="">— wählen —</option>
-                {projects.map(p => (
-                  <option key={p.id} value={p.id}>{p.name}</option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              Start
-              <input
-                type="datetime-local"
-                value={editStart}
-                onChange={(e) => setEditStart(e.target.value)}
-              />
-            </label>
-
-            <label>
-              Ende
-              <input
-                type="datetime-local"
-                value={editEnd}
-                onChange={(e) => setEditEnd(e.target.value)}
-              />
-            </label>
-
-            <div style={{ display: "flex", gap: 8 }}>
-              <button onClick={saveEdit}>Speichern</button>
-              <button onClick={cancelEdit}>Abbrechen</button>
-            </div>
+          <div style={{ marginTop: 10 }}>
+            <label>Logo für PDF: </label>
+            <input type="file" accept="image/*" onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (!file) return;
+              const reader = new FileReader();
+              reader.onload = (ev) => setLogoDataUrl(ev.target.result);
+              reader.readAsDataURL(file);
+            }} />
           </div>
-        </div>
+
+          {/* Daten-Werkzeuge */}
+          <h4 style={{ marginTop: 16 }}>Daten-Werkzeuge</h4>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <button onClick={async () => {
+              const local = safeParse(localStorage.getItem(LS_KEYS.legacy_records), []);
+              if (!Array.isArray(local) || local.length === 0) {
+                alert("Keine lokalen Zeiten gefunden.");
+                return;
+              }
+              if (!confirm(`Es werden ${local.length} lokale Einträge versucht zu migrieren. Fortfahren?`)) return;
+
+              const empByName = new Map(employees.map((e) => [e.name, e.id]));
+              const projByName = new Map(projects.map((p) => [p.name, p.id]));
+
+              let ok = 0, fail = 0;
+              for (const r of local) {
+                try {
+                  const employee_id = empByName.get(r.employee);
+                  const project_id = projByName.get(r.project);
+                  if (!employee_id || !project_id || !r.startISO || !r.endISO) { fail++; continue; }
+                  const { minutes, lunchApplied } = subtractLunchIfNeeded(r.startISO, r.endISO);
+                  const { error } = await supabase.from("records").insert({
+                    employee_id, project_id,
+                    start_iso: r.startISO,
+                    end_iso: r.endISO,
+                    duration_minutes: minutes,
+                    lunch_applied: lunchApplied,
+                  });
+                  if (error) { fail++; continue; }
+                  ok++;
+                } catch { fail++; }
+              }
+              await loadRecords();
+              alert(`Migration abgeschlossen: ${ok} importiert, ${fail} übersprungen.`);
+            }}>
+              Lokale Zeiten → Supabase (einmalig)
+            </button>
+          </div>
+        </section>
       )}
     </div>
   );
 }
-
